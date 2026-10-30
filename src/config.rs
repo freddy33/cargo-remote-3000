@@ -19,6 +19,7 @@ use log::debug;
 use serde::Deserialize;
 
 use crate::cli::RemoteOpts;
+use crate::lane::DEFAULT_MAX_LANES;
 
 /// Directory and file name used under the user config root.
 const APP_DIR: &str = "cargo-remote-3000";
@@ -39,6 +40,8 @@ pub const DEFAULT_SSH_PORT: u16 = 22;
 /// that reliably puts `cargo` on `PATH` for a non-login ssh session. See
 /// issue #16.
 pub const DEFAULT_ENV: &str = "~/.cargo/env";
+/// Default number of seconds to wait for a lane that is already leased.
+pub const DEFAULT_LOCK_TIMEOUT: u64 = 3600;
 
 /// A fully resolved remote: config defaults with command line overrides applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +54,15 @@ pub struct Remote {
     pub temp_dir: String,
     pub env: Vec<String>,
     pub exclude: Vec<String>,
+    /// Independent build lane, or `None` for the shared default lane.
+    pub lane: Option<String>,
+    /// Toolchain for this invocation only; `None` leaves the server default and
+    /// any `rust-toolchain.toml` alone.
+    pub toolchain: Option<String>,
+    /// How many lanes one project may fan out to before a build has to wait.
+    pub max_lanes: usize,
+    /// Seconds to wait for a lane that is already leased before giving up.
+    pub lock_timeout: u64,
 }
 
 /// On-disk shape of a `[[remote]]` entry. Every field except `host` is optional.
@@ -74,6 +86,14 @@ struct PartialRemote {
     env: Option<EnvSpec>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    lane: Option<String>,
+    #[serde(default)]
+    toolchain: Option<String>,
+    #[serde(default)]
+    max_lanes: Option<usize>,
+    #[serde(default)]
+    lock_timeout: Option<u64>,
 }
 
 /// `env` may be given as a single string or as a list of strings.
@@ -118,9 +138,18 @@ pub struct Config {
 impl Config {
     /// Read the user config, then the project config, and merge them.
     pub fn load(project_dir: &Path) -> Result<Self> {
+        Self::load_with_user_config(project_dir, user_config_path())
+    }
+
+    /// Same as [`Config::load`], with the user config named explicitly.
+    ///
+    /// Tests pass `None` so that whoever runs them is not silently influenced by
+    /// their own `~/.config` — the failure that produces is a bare
+    /// "left: 2, right: 1" with no hint of where the extra remote came from.
+    fn load_with_user_config(project_dir: &Path, user_config: Option<PathBuf>) -> Result<Self> {
         let mut remotes: Vec<PartialRemote> = Vec::new();
 
-        if let Some(user_config) = user_config_path() {
+        if let Some(user_config) = user_config {
             if user_config.is_file() {
                 debug!("using user config {}", user_config.display());
                 for remote in ConfigFile::load(&user_config)?.remote {
@@ -237,8 +266,49 @@ impl Config {
             } else {
                 opts.exclude.clone()
             },
+            lane: opts.lane.clone().or_else(|| base.lane.clone()),
+            // Resolved here, so every `Remote` in the program carries a
+            // toolchain name that is safe to interpolate into the remote
+            // script. None means "do not select one at all", which is what
+            // leaves a project's `rust-toolchain.toml` in charge.
+            toolchain: match opts.toolchain.clone().or_else(|| base.toolchain.clone()) {
+                Some(toolchain) => {
+                    validate_toolchain(&toolchain)?;
+                    Some(toolchain)
+                }
+                None => None,
+            },
+            max_lanes: opts
+                .max_lanes
+                .or(base.max_lanes)
+                .unwrap_or(DEFAULT_MAX_LANES),
+            lock_timeout: opts
+                .lock_timeout
+                .or(base.lock_timeout)
+                .unwrap_or(DEFAULT_LOCK_TIMEOUT),
         })
     }
+}
+
+/// Reject toolchain names that are not plain rustup identifiers.
+///
+/// The name is interpolated into the remote shell script, so it must not be able
+/// to carry shell syntax. It is also matched as a `grep` pattern against
+/// `rustup toolchain list`, so keep it to characters that mean one thing in a
+/// POSIX basic regular expression.
+pub fn validate_toolchain(toolchain: &str) -> Result<()> {
+    let valid = !toolchain.is_empty()
+        && toolchain.len() <= 64
+        && toolchain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if !valid {
+        bail!(
+            "unsupported toolchain {toolchain:?}; use a rustup name such as \
+             1.95.0, nightly, stable or nightly-2026-01-01"
+        );
+    }
+    Ok(())
 }
 
 /// Placeholder used when only `--host` was given.
@@ -251,6 +321,10 @@ static EMPTY_REMOTE: PartialRemote = PartialRemote {
     temp_dir: None,
     env: None,
     exclude: Vec::new(),
+    lane: None,
+    toolchain: None,
+    max_lanes: None,
+    lock_timeout: None,
 };
 
 /// Insert `remote`, replacing an existing entry with the same name.
@@ -281,6 +355,10 @@ impl PartialRemote {
         if !other.exclude.is_empty() {
             self.exclude = other.exclude;
         }
+        self.lane = other.lane.or(self.lane.take());
+        self.toolchain = other.toolchain.or(self.toolchain.take());
+        self.max_lanes = other.max_lanes.or(self.max_lanes.take());
+        self.lock_timeout = other.lock_timeout.or(self.lock_timeout.take());
     }
 }
 
@@ -354,7 +432,7 @@ mod tests {
 
     fn remote_from_project(dir: &Path, toml_text: &str) -> Config {
         std::fs::write(dir.join(PROJECT_FILE), toml_text).unwrap();
-        Config::load(dir).unwrap()
+        Config::load_with_user_config(dir, None).unwrap()
     }
 
     #[test]
@@ -548,7 +626,7 @@ mod tests {
             "[[remote]]\nhost = \"me@legacy\"\n",
         )
         .unwrap();
-        let conf = Config::load(dir.path()).unwrap();
+        let conf = Config::load_with_user_config(dir.path(), None).unwrap();
         assert_eq!(
             conf.get_remote(&RemoteOpts::default()).unwrap().host,
             "me@legacy"
@@ -559,7 +637,9 @@ mod tests {
     fn malformed_config_reports_the_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(PROJECT_FILE), "this is not toml {{{").unwrap();
-        let err = Config::load(dir.path()).unwrap_err().to_string();
+        let err = Config::load_with_user_config(dir.path(), None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(PROJECT_FILE), "{err}");
     }
 
@@ -576,6 +656,10 @@ mod tests {
             temp_dir: "~/remote-builds".into(),
             env: vec![],
             exclude: vec![],
+            lane: None,
+            toolchain: None,
+            max_lanes: DEFAULT_MAX_LANES,
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
         };
         assert_eq!(remote.temp_dir, "~/remote-builds");
     }
@@ -591,6 +675,10 @@ mod tests {
             temp_dir: DEFAULT_TEMP_DIR.into(),
             env: vec![],
             exclude: vec![],
+            lane: None,
+            toolchain: None,
+            max_lanes: DEFAULT_MAX_LANES,
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
         };
         assert_eq!(
             remote.ssh_args(),

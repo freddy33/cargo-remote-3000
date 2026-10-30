@@ -3,12 +3,11 @@
 
 mod cli;
 mod config;
+mod lane;
 mod project;
 mod remote;
 mod watch;
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -19,7 +18,7 @@ use log::{debug, info};
 use cli::{Cli, Command, Remote as RemoteArgs};
 use config::Config;
 use project::Project;
-use remote::Session;
+use remote::{Session, BUSY_EXIT};
 
 /// Exit codes. A failing remote build propagates its own status instead.
 mod exit {
@@ -27,6 +26,11 @@ mod exit {
     pub const SETUP: u8 = 3;
     pub const TRANSFER: u8 = 4;
 }
+
+/// How many times a build may lose its lane to a concurrent build before the
+/// tool gives up. Each retry picks a different lane, so this is a "something is
+/// very wrong" bound rather than a queue.
+const LANE_RETRIES: usize = 3;
 
 /// An error plus the exit code it should produce.
 struct Failure {
@@ -93,41 +97,91 @@ fn run() -> Outcome {
         .get_remote(&args.remote)
         .map_err(|error| Failure::new(exit::SETUP, error))?;
 
-    let build_root = remote_build_root(&remote.temp_dir, project.project_root());
-    let session = Session {
-        remote: &remote,
-        project_root: project.project_root(),
-        workspace_root: project.workspace_root(),
-        build_root: build_root.clone(),
-        remote_workspace_root: join_remote(&build_root, project.workspace_relative()),
-        remote_crate_dir: join_remote(&build_root, project.crate_relative()),
-        local_target_dir: project.local_target_dir().to_path_buf(),
-        remote_target_dir: project.remote_target_dir(&build_root),
-        upload_excludes: remote.exclude.clone(),
-        transfer_hidden: args.transfer_hidden,
-        no_transfer_git: args.no_transfer_git,
-        verbose: args.verbose > 0,
-    };
+    let project_hash = lane::project_hash(project.project_root());
+    // A lane the caller asked for by name is a statement about which tree they
+    // want, so it is kept and waited for. Without one, the server is asked for a
+    // free lane and the build moves rather than queues.
+    let requested = requested_lane(&args, &remote).map_err(|e| Failure::new(exit::USAGE, e))?;
+    let run_id = lane::run_id();
 
-    info!("Build path: {build_root}");
-    info!("Remote crate directory: {}", session.remote_crate_dir);
-
+    // A watch session owns its lane for as long as it runs, so it waits for it
+    // rather than moving on every rebuild.
     if args.watch {
+        let session = make_session(
+            &remote,
+            &project,
+            &project_hash,
+            requested.as_deref().unwrap_or(lane::DEFAULT_LANE),
+            &run_id,
+            true,
+            &args,
+        );
         return run_watch(&args, &session);
     }
 
+    // Upload before a lane is chosen. The staging directory is lane independent,
+    // so losing a lane race costs nothing but a retry.
+    let mut session = make_session(
+        &remote,
+        &project,
+        &project_hash,
+        requested.as_deref().unwrap_or(lane::DEFAULT_LANE),
+        &run_id,
+        requested.is_some(),
+        &args,
+    );
     session
         .upload()
         .map_err(|error| Failure::new(exit::TRANSFER, error))?;
 
-    let status = session
-        .run_remote_command(
-            &args.build_env,
-            &args.rustup_default,
-            &args.command,
-            &args.args,
-        )
-        .map_err(|error| Failure::new(exit::TRANSFER, error))?;
+    let mut attempts = 0usize;
+    let status = loop {
+        let status = session
+            .build(&args.build_env, &args.command, &args.args)
+            .map_err(|error| Failure::new(exit::TRANSFER, error))?;
+
+        if status.code() != Some(BUSY_EXIT as i32) || requested.is_some() {
+            break status;
+        }
+        if attempts >= LANE_RETRIES {
+            return Err(Failure::new(
+                exit::TRANSFER,
+                anyhow::anyhow!(
+                    "every build lane for this project was taken by another build \
+                     {attempts} times in a row; raise --max-lanes, or pass --lane to \
+                     claim a tree of your own"
+                ),
+            ));
+        }
+        attempts += 1;
+
+        let allocation =
+            remote::allocate(&remote, &project_hash, lane::DEFAULT_LANE, remote.max_lanes)
+                .map_err(|error| Failure::new(exit::TRANSFER, error))?;
+        let Some(allocation) = allocation else {
+            return Err(Failure::new(
+                exit::TRANSFER,
+                anyhow::anyhow!(
+                    "all {} lanes of this project are in use by other builds; wait for \
+                     one to finish, raise --max-lanes, or pass --lane to claim a tree",
+                    remote.max_lanes
+                ),
+            ));
+        };
+        info!(
+            "Lane {} was taken by another build; moving to lane {}",
+            session.lane, allocation.lane
+        );
+        session = make_session(
+            &remote,
+            &project,
+            &project_hash,
+            &allocation.lane,
+            &run_id,
+            false,
+            &args,
+        );
+    };
 
     copy_back(&args, &session).map_err(|error| Failure::new(exit::TRANSFER, error))?;
 
@@ -142,6 +196,39 @@ fn run() -> Outcome {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Build the session description for one lane.
+fn make_session<'a>(
+    remote: &'a config::Remote,
+    project: &'a Project,
+    project_hash: &str,
+    lane: &str,
+    run_id: &str,
+    wait_for_lane: bool,
+    args: &RemoteArgs,
+) -> Session<'a> {
+    let build_root = lane::lane_root(&remote.temp_dir, lane, project_hash);
+    Session {
+        remote,
+        project_root: project.project_root(),
+        workspace_root: project.workspace_root(),
+        lane: lane.to_string(),
+        project_hash: project_hash.to_string(),
+        build_root: build_root.clone(),
+        remote_workspace_root: join_remote(&build_root, project.workspace_relative()),
+        remote_crate_dir: join_remote(&build_root, project.crate_relative()),
+        local_target_dir: project.local_target_dir().to_path_buf(),
+        remote_target_dir: project.remote_target_dir(&build_root),
+        stage_root: lane::staging_root(&remote.temp_dir, project_hash, run_id),
+        run_id: run_id.to_string(),
+        wait_for_lane,
+        upload_excludes: remote.exclude.clone(),
+        transfer_hidden: args.transfer_hidden,
+        no_transfer_git: args.no_transfer_git,
+        lock_timeout: remote.lock_timeout,
+        verbose: args.verbose > 0,
+    }
 }
 
 /// Copy artifacts and the lock file home.
@@ -179,12 +266,7 @@ fn run_watch(args: &RemoteArgs, session: &Session) -> Outcome {
 
     let run_build = || -> Result<()> {
         session.upload()?;
-        let status = session.run_remote_command(
-            &args.build_env,
-            &args.rustup_default,
-            &args.command,
-            &args.args,
-        )?;
+        let status = session.build(&args.build_env, &args.command, &args.args)?;
         if !status.success() {
             bail!("remote build failed with {status}");
         }
@@ -205,18 +287,28 @@ fn run_watch(args: &RemoteArgs, session: &Session) -> Outcome {
     }
 }
 
-/// Stable per-project build directory on the build server.
+/// Resolve the lane the caller asked for by name, if any.
 ///
-/// Hashing the local path means two checkouts of the same project on different
-/// machines still land in one remote directory, and re-running after a reboot
-/// reuses the previous target directory instead of rebuilding from scratch.
-fn remote_build_root(temp_dir: &str, project_root: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    project_root.hash(&mut hasher);
-    // A leading `~` is left for the remote shell to expand: the build host's
-    // home directory has nothing to do with the local one.
-    let temp_dir = temp_dir.trim_end_matches('/');
-    format!("{temp_dir}/{:016x}", hasher.finish())
+/// `--lane` wins over `$CARGO_REMOTE_3000_LANE`, which wins over the config file.
+/// The environment variable matters because it lets a fleet give every agent its
+/// own lane once, in its shell, without threading a flag through every Makefile.
+/// No name at all is the interesting case: it means "give me any free tree".
+fn requested_lane(args: &RemoteArgs, remote: &config::Remote) -> Result<Option<String>> {
+    let lane = args
+        .remote
+        .lane
+        .clone()
+        .or_else(|| {
+            std::env::var("CARGO_REMOTE_3000_LANE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| remote.lane.clone());
+
+    if let Some(name) = &lane {
+        lane::validate_lane(name)?;
+    }
+    Ok(lane)
 }
 
 /// Join a remote path fragment onto a remote base directory.
@@ -234,37 +326,6 @@ fn join_remote(base: &str, relative: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn build_root_is_stable_for_the_same_path() {
-        let a = remote_build_root("~/remote-builds", Path::new("/home/me/project"));
-        let b = remote_build_root("~/remote-builds", Path::new("/home/me/project"));
-        assert_eq!(a, b);
-        assert!(a.ends_with(|c: char| c.is_ascii_hexdigit()), "{a}");
-    }
-
-    #[test]
-    fn build_root_differs_per_project() {
-        let a = remote_build_root("~/remote-builds", Path::new("/home/me/one"));
-        let b = remote_build_root("~/remote-builds", Path::new("/home/me/two"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn build_root_normalises_the_temp_dir() {
-        let with_slash = remote_build_root("~/remote-builds/", Path::new("/p"));
-        let without = remote_build_root("~/remote-builds", Path::new("/p"));
-        assert_eq!(with_slash, without);
-        assert!(!with_slash.contains("//"), "{with_slash}");
-    }
-
-    #[test]
-    fn build_root_leaves_the_tilde_for_the_remote_shell() {
-        // The build directory lives on the build server, so expanding `~` with
-        // the *local* home directory would point at the wrong place.
-        let root = remote_build_root("~/remote-builds", Path::new("/p"));
-        assert!(root.starts_with("~/remote-builds/"), "{root}");
-    }
 
     #[test]
     fn join_remote_handles_the_workspace_root_itself() {

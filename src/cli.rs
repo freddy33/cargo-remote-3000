@@ -86,6 +86,47 @@ pub struct RemoteOpts {
     /// Exclude pattern passed to rsync when uploading sources. Repeatable.
     #[arg(short = 'x', long, value_name = "PATTERN")]
     pub exclude: Vec<String>,
+
+    /// Independent build lane on the build server
+    ///
+    /// Each lane has its own source tree and its own `target/`, so builds in
+    /// different lanes never disturb each other and run in parallel. Two
+    /// invocations in the same lane are serialised instead of corrupting each
+    /// other. Defaults to `$CARGO_REMOTE_3000_LANE`, or to the shared default
+    /// lane when that is unset.
+    #[arg(short = 'l', long, value_name = "NAME")]
+    pub lane: Option<String>,
+
+    /// Rustup toolchain used on the remote host, e.g. stable, beta or nightly
+    ///
+    /// Selected per invocation with `RUSTUP_TOOLCHAIN`. The remote host's
+    /// global default is never changed, so one build can no longer re-point the
+    /// compiler under another. When neither this flag nor a `toolchain` config
+    /// key is set, the build server's own default (or the project's
+    /// `rust-toolchain.toml`) applies.
+    #[arg(
+        short = 'd',
+        long = "rustup-default",
+        visible_alias = "toolchain",
+        value_name = "TOOLCHAIN"
+    )]
+    pub toolchain: Option<String>,
+
+    /// How many lanes one project may fan out to before a build has to wait
+    ///
+    /// A build with no lane of its own takes `default`, then `default-2`, and so
+    /// on, so concurrent builds never queue for a tree. Only when every lane is
+    /// in use does a build wait — or fail with `--lock-timeout 0`.
+    #[arg(long, value_name = "N")]
+    pub max_lanes: Option<usize>,
+
+    /// Seconds to wait for a lane that is already leased
+    ///
+    /// Only reached when a lane was named explicitly, or when every automatic
+    /// lane is in use. 0 fails immediately instead of queueing, which is what a
+    /// CI job that should never wait wants.
+    #[arg(long, value_name = "SECS")]
+    pub lock_timeout: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -102,10 +143,6 @@ pub struct Remote {
         allow_hyphen_values = true
     )]
     pub build_env: Vec<String>,
-
-    /// Rustup toolchain used on the remote host, e.g. stable, beta or nightly
-    #[arg(short = 'd', long, value_name = "TOOLCHAIN", default_value = "stable")]
-    pub rustup_default: String,
 
     /// Copy the remote target directory back, or just one path within it.
     ///

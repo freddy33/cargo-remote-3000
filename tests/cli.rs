@@ -145,10 +145,26 @@ fn write_crate(dir: &Path) {
 fn remote_dir(invocation: &str) -> String {
     let path = invocation
         .split_whitespace()
-        .find(|word| word.contains("/remote-builds/"))
+        .find(|word| word.contains("/incoming/") || word.contains("/lanes/"))
         .unwrap_or_else(|| panic!("expected a remote path in {invocation}"));
     let path = path.rsplit(':').next().unwrap_or(path);
     path.trim_end_matches([';', '\'', '"']).to_string()
+}
+
+/// The directory the remote cargo invocation runs in.
+///
+/// A build script also touches remote paths for its lease and its mirror, so the
+/// crate directory is the one after `cd`.
+fn ssh_cd_dir(invocation: &str) -> String {
+    let after_cd = invocation
+        .split("cd ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected a cd in {invocation}"));
+    after_cd
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn assert_success(output: &std::process::Output) {
@@ -328,7 +344,10 @@ fn the_toolchain_and_build_environment_are_applied_remotely() {
     ]));
 
     let ssh = harness.ssh_command();
-    assert!(ssh.contains("rustup default nightly"), "{ssh}");
+    // Selected for this build only. Writing the server's global default is what
+    // used to let one build re-point every other build's compiler.
+    assert!(ssh.contains("RUSTUP_TOOLCHAIN=nightly"), "{ssh}");
+    assert!(!ssh.contains("rustup default"), "{ssh}");
     assert!(ssh.contains("RUST_BACKTRACE=full cargo build"), "{ssh}");
 }
 
@@ -555,7 +574,7 @@ fn a_workspace_build_targets_the_workspace_root_target_directory() {
     // `<build dir>/crates/app` rather than keeping the local `nested/` prefix.
     // Only the workspace root is uploaded, so the crate directory mirrors to
     // `<build dir>/crates/app` rather than keeping the local `nested/` prefix.
-    let dir = remote_dir(ssh);
+    let dir = ssh_cd_dir(ssh);
     assert!(
         dir.ends_with("/crates/app"),
         "cargo should run in the crate dir, got {dir}"
@@ -600,4 +619,223 @@ fn verbose_logs_the_commands_it_runs() {
 
     assert!(stderr.contains("running:"), "{stderr}");
     assert!(stderr.contains("rsync"), "{stderr}");
+}
+
+#[test]
+fn a_build_stages_outside_the_lane_and_takes_a_lease() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "--no-copy-lock", "build"]));
+
+    // Sources land in a per-run staging directory, never in the shared lane, so
+    // two uploads cannot rewrite each other.
+    let upload = harness.rsync_command(0);
+    assert!(remote_dir(&upload).contains("/incoming/"), "{upload}");
+
+    // The lane itself is mutated only under an exclusive lease.
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("exec 9>"), "{ssh}");
+    assert!(ssh.contains("flock -n 9"), "{ssh}");
+    assert!(ssh.contains(".lock.owner"), "{ssh}");
+
+    // An automatically chosen lane is never waited for: contention means moving
+    // to another lane, not queueing behind this one.
+    assert!(!ssh.contains("flock -w"), "{ssh}");
+}
+
+#[test]
+fn the_default_lane_is_used_without_any_flag() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "build"]));
+    assert!(
+        ssh_cd_dir(&harness.ssh_command()).contains("/lanes/default/"),
+        "{}",
+        harness.ssh_command()
+    );
+}
+
+#[test]
+fn a_named_lane_gets_its_own_tree_and_waits_for_it() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "-l", "alice", "build"]));
+
+    let ssh = harness.ssh_command();
+    assert!(ssh_cd_dir(&ssh).contains("/lanes/alice/"), "{ssh}");
+    // A lane the caller named is a statement about which tree is wanted, so it
+    // is waited for instead of silently relocating.
+    assert!(ssh.contains("flock -w 3600 9"), "{ssh}");
+}
+
+#[test]
+fn a_named_lane_can_fail_fast_instead_of_waiting() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&[
+        "-H",
+        "user@build-host",
+        "-l",
+        "alice",
+        "--lock-timeout",
+        "0",
+        "build",
+    ]));
+
+    let ssh = harness.ssh_command();
+    assert!(!ssh.contains("flock -w"), "{ssh}");
+    assert!(ssh.contains("exit 75"), "{ssh}");
+}
+
+#[test]
+fn the_lane_can_come_from_the_environment() {
+    let harness = Harness::new();
+    let output = harness
+        .command(&["-H", "user@build-host", "build"])
+        .env("CARGO_REMOTE_3000_LANE", "agent7")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let ssh = harness.ssh_command();
+    assert!(ssh_cd_dir(&ssh).contains("/lanes/agent7/"), "{ssh}");
+    // A lane from the environment is still a named lane.
+    assert!(ssh.contains("flock -w 3600 9"), "{ssh}");
+}
+
+#[test]
+fn a_busy_lane_is_replaced_rather_than_waited_for() {
+    // The core promise: a build that loses its lane moves to another one, with
+    // no second upload and no wait.
+    let bin = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+
+    let log = bin.path().join("commands.log");
+    let counter = bin.path().join("count");
+    let ssh = bin.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{counter}" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s' "$n" > "{counter}"
+printf 'ssh' >> "{log}"
+for arg in "$@"; do printf ' %s' "$arg" >> "{log}"; done
+printf '\n' >> "{log}"
+case "$n" in
+  1) exit 75 ;;
+  2) printf 'LANE=default-2\n' ;;
+  *) exit 0 ;;
+esac
+"#,
+            counter = counter.display(),
+            log = log.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&ssh);
+    let rsync = bin.path().join("rsync");
+    std::fs::write(
+        &rsync,
+        format!(
+            "#!/bin/sh\nprintf 'rsync' >> \"{log}\"\nfor arg in \"$@\"; do printf ' %s' \"$arg\" >> \"{log}\"; done\nprintf '\\n' >> \"{log}\"\nexit 0\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&rsync);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args([
+            "remote-3000",
+            "-H",
+            "user@build-host",
+            "--no-copy-lock",
+            "build",
+        ])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", bin.path())
+        .env("HOME", bin.path())
+        .env("APPDATA", bin.path())
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("moving to lane default-2"), "{stderr}");
+
+    let commands: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let ssh_calls: Vec<&String> = commands.iter().filter(|l| l.starts_with("ssh ")).collect();
+    assert_eq!(ssh_calls.len(), 3, "{commands:#?}");
+    // The retry runs in the new lane.
+    assert!(
+        ssh_calls[2].contains("/lanes/default-2/"),
+        "{}",
+        ssh_calls[2]
+    );
+    // The stage is lane independent, so the retry reuses the upload.
+    let rsync_calls = commands.iter().filter(|l| l.starts_with("rsync ")).count();
+    assert_eq!(rsync_calls, 1, "{commands:#?}");
+}
+
+#[test]
+fn every_lane_being_busy_is_reported_with_knobs() {
+    // The fake ssh always reports the lane busy, so allocation finds nothing.
+    let bin = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+
+    let ssh = bin.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\ncase \"$*\" in *LANE=*) printf 'LANE=\\n' ;; *) exit 75 ;; esac\n",
+    )
+    .unwrap();
+    make_executable(&ssh);
+    let rsync = bin.path().join("rsync");
+    std::fs::write(&rsync, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&rsync);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args([
+            "remote-3000",
+            "-H",
+            "user@build-host",
+            "--max-lanes",
+            "2",
+            "--no-copy-lock",
+            "build",
+        ])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", bin.path())
+        .env("HOME", bin.path())
+        .env("APPDATA", bin.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lanes of this project are in use"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--lane"), "{stderr}");
 }

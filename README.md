@@ -23,6 +23,7 @@ fails your local command with the build server's own exit code.
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Usage](#usage)
+- [Concurrent builds](#concurrent-builds)
 - [Configuration](#configuration)
 - [Watch mode](#watch-mode)
 - [Workspaces and path dependencies](#workspaces-and-path-dependencies)
@@ -70,7 +71,9 @@ original tool carries over.
 **Locally:** `ssh` and `rsync`.
 
 **On the build server:** ssh access, [rustup] with a toolchain matching or close
-to your local one, and a C toolchain for linking.
+to your local one, a C toolchain for linking, and `flock` (util-linux), which is
+what serialises concurrent builds of one lane. Without `flock` the tool warns
+once and builds without a lease — fine on a quiet server, unsafe under load.
 
 Both machines need the same target architecture and an ABI-compatible libc,
 since artifacts are copied back to run locally. If the remote build fails with
@@ -181,7 +184,7 @@ command name is never mistaken for the copy-back path.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-d, --rustup-default <TOOLCHAIN>` | `stable` | Toolchain selected on the build host |
+| `-d, --rustup-default, --toolchain <TOOLCHAIN>` | host default | Toolchain for this build only; see [Toolchains](#toolchains) |
 | `-b, --build-env <VARS>` | `RUST_BACKTRACE=1` | Remote environment variables. Repeatable |
 | `-e, --env <SCRIPT>` | `~/.cargo/env` | Script sourced before the build. Repeatable |
 | `--manifest-path <PATH>` | `Cargo.toml` | Manifest to build |
@@ -195,6 +198,14 @@ command name is never mistaken for the copy-back path.
 | `-x, --exclude <PATTERN>` | — | rsync exclude pattern for the upload. Repeatable |
 | `--transfer-hidden` | off | Upload dotfiles, including `.git` |
 | `--no-transfer-git` | off | Never upload `.git`, even with `--transfer-hidden` |
+
+#### Concurrency
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-l, --lane <NAME>` | any free lane | Independent build lane on the server |
+| `--max-lanes <N>` | `8` | How many lanes one project may fan out to |
+| `--lock-timeout <SECS>` | `3600` | Wait for a named lane this long; `0` fails fast |
 
 #### Getting results back
 
@@ -214,6 +225,80 @@ command name is never mistaken for the copy-back path.
 
 `RUST_LOG=debug` gives the same detail as `-v`; `RUST_LOG=warn` quiets the rsync
 progress output down to just warnings.
+
+## Concurrent builds
+
+Several builds can run on one build server at the same time, and none of them
+waits for another. The unit of concurrency is a **lane**: one source tree plus its
+own `target/` on the server.
+
+| What you pass | What happens |
+| --- | --- |
+| nothing | a free lane is taken: `default`, then `default-2`, `default-3`, ... |
+| `-l alice` or `CARGO_REMOTE_3000_LANE=alice` | the `alice` lane is claimed, and waited for if busy |
+| `--max-lanes N` | how many lanes one project may fan out to (default 8) |
+| `--lock-timeout S` | seconds to wait for a named lane (default 3600); `0` fails fast |
+
+A lane rather than a lock, because two builds of one mutable source tree cannot
+both be correct: the upload is `rsync --delete` and cargo takes an exclusive lock
+on `target/`, so a second build would either compile the first one's files or sit
+in an invisible wait. Distinct trees remove the question instead of arbitrating
+it.
+
+What a build does with its tree, in order:
+
+1. **Allocate.** With no lane named, the server is asked which lane is free. The
+   answer is a hint, not a reservation: if another build wins that lane in the
+   same moment, the build exits `75` without starting and the tool allocates
+   again. No upload is repeated, because staging is lane independent.
+2. **Upload** into `<temp_dir>/incoming/<hash>/<run-id>/`. Nothing is locked here,
+   because nothing here is shared.
+3. **Lease and compile.** One ssh session takes an exclusive `flock` on
+   `<lane>/<hash>.lock`, mirrors the stage into the lane, and runs cargo. A killed
+   client releases the lease by dying with the remote shell, so there is no lease
+   to clean up by hand.
+4. **Share the CPU.** Before compiling, the build counts the lanes already leased
+   and exports `CARGO_BUILD_JOBS = cores / (others + 1)`, so four concurrent
+   builds get four cores between them instead of sixteen threads. An explicit
+   `-b CARGO_BUILD_JOBS=N` always wins.
+
+Layout on the server:
+
+| Path | Contents |
+| --- | --- |
+| `<temp_dir>/lanes/<lane>/<hash>/` | one tree per lane, with its own `target/` |
+| `<temp_dir>/lanes/<lane>/<hash>.lock` | that lane's lease |
+| `<temp_dir>/incoming/<hash>/<run-id>/` | per-run staging; stale ones are pruned after a day |
+
+Name a lane only when you want one particular warm tree — a long watch session, a
+benchmark that must compare like with like, or CI that should not silently change
+trees between runs. Otherwise pass nothing and let the tool pick.
+
+### Toolchains
+
+One server can hold as many Rust toolchains as you like. rustup installs them into
+a shared `RUSTUP_HOME` and each build selects one with `RUSTUP_TOOLCHAIN`, so there
+is no global default to keep in sync and one build cannot re-point another's
+compiler.
+
+| Where the pin lives | Scope |
+| --- | --- |
+| `-d 1.95.0` / `--toolchain` | this invocation |
+| `toolchain = "1.95.0"` in the config file | this project, or every project using that remote |
+| `rust-toolchain.toml` in the repository | the repository — travels with the code |
+
+A toolchain the server does not have is installed on demand, announced on stderr,
+and does **not** become anyone's default; the first build after a new version is
+slower than the rest. With no toolchain requested, the server's own default
+applies and a `rust-toolchain.toml` in the repository takes precedence over it.
+
+If the server installs Rust through something else (mise, nix, a distro package),
+pass no `-d`: the tool only needs a working `cargo` on the server's `PATH`. Do not
+configure two selectors for one build — an explicit toolchain is the only one the
+tool can reason about.
+
+An agent-facing summary of this contract ships with the repository in
+[`cargo-remote-build-skill/SKILL.md`](cargo-remote-build-skill/SKILL.md).
 
 ## Configuration
 
@@ -236,6 +321,10 @@ ssh_port = 22
 temp_dir = "~/remote-builds"
 env = "~/.cargo/env"
 exclude = ["assets/", "*.png"]
+toolchain = "1.95.0"           # optional pin; omit to use the server default
+lane = "alice"                # optional: always build in this lane
+max_lanes = 8                  # optional: how far automatic lanes may fan out
+lock_timeout = 3600            # optional: seconds to wait for a named lane
 
 [[remote]]
 name = "rack"
@@ -247,7 +336,9 @@ temp_dir = "/var/tmp/rust"
 ```
 
 Only `host` is required. Anything omitted falls back to a default, and every
-field can be overridden on the command line.
+field can be overridden on the command line. An unknown key is ignored rather
+than rejected, so a misspelled pin reads like a guarantee and pins nothing —
+check with `-v` when a setting seems to have no effect.
 
 > `-r` selects a remote **by name**; `-H` is the **host** itself. This matches
 > the original tool, though some older bug reports used `-r` as though it took
@@ -334,34 +425,41 @@ fetched from wherever Cargo would actually have put them.
 
 ## How it works
 
-For each project, cargo-remote-3000 derives a stable directory on the build
-server by hashing the local project path:
+For each project and lane, cargo-remote-3000 derives a stable directory on the
+build server:
 
 ```
-<temp_dir>/<hash-of-local-project-path>
+<temp_dir>/lanes/<lane>/<hash-of-local-project-path>
 ```
 
-Because the hash comes from the local path, two checkouts of the same project on
+The hash comes from the local path, so two checkouts of the same project on
 different machines resolve to the *same* remote directory and share one warm
-`target/` cache.
+`target/` per lane.
 
-Each run then does three things:
+Each run then does four things:
 
-1. **Upload** — `rsync --delete` the project tree to the remote directory,
-   skipping `target/`, hidden files (unless `--transfer-hidden`) and any
-   `-x` patterns. rsync shells out to ssh with the same port, identity file and
-   options you passed.
-2. **Build** — one ssh invocation running a small POSIX shell script that sources
-   the `env` scripts, selects the toolchain, `cd`s into the crate and runs
-   `cargo <command> <args>`. Arguments are shell-quoted, and the build's exit
+1. **Allocate a lane** — none named: ask the server which candidate is free (see
+   [Concurrent builds](#concurrent-builds)). A lost race is answered with another
+   lane, never with a wait.
+2. **Upload** — `rsync --delete` the project tree into
+   `<temp_dir>/incoming/<hash>/<run-id>/`, skipping `target/`, hidden files
+   (unless `--transfer-hidden`) and any `-x` patterns. rsync shells out to ssh
+   with the same port, identity file and options you passed. The stage is outside
+   every lane, so concurrent uploads cannot overwrite each other and a build that
+   changes lanes keeps its upload.
+3. **Build** — one ssh invocation running a small POSIX shell script that takes an
+exclusive `flock` on the lane, mirrors the stage into it, sources the `env`
+   scripts, selects the toolchain for that process only, `cd`s into the crate and
+   runs `cargo <command> <args>`. Arguments are shell-quoted, and the build's exit
    status is propagated back to your shell.
-3. **Copy back** — optionally `rsync` the target directory (or one path in it)
+4. **Copy back** — optionally `rsync` the target directory (or one path in it)
    home, skipping `deps/`, `build/`, `.fingerprint/` and `incremental/`, which
    are either regenerated locally or large enough to dominate transfer time.
    `Cargo.lock` comes back too unless you pass `--no-copy-lock`.
 
-Everything the tool needs from the build server is ssh plus `cargo`. There is no
-daemon, no agent and no state beyond that one directory per project.
+Everything the tool needs from the build server is ssh, `rsync`, `flock` and
+`cargo`. There is no daemon, no agent, and no state beyond the directories under
+`temp_dir`.
 
 ## Troubleshooting
 
@@ -490,9 +588,17 @@ cargo build --release
 
 The end-to-end tests in `tests/cli.rs` run the real binary against a fake `rsync`
 and `ssh` on `PATH` that record their arguments, so they assert on exactly what
-would be transferred and run without needing a build server.
+would be transferred and run without needing a build server. The lane allocator,
+the lane race and the retry path are covered there, because those are the
+behaviours that only show up under concurrency.
 
-Minimum supported Rust version: **1.85** (edition 2021).
+An agent-facing description of the runtime contract ships as a skill in
+[`cargo-remote-build-skill/SKILL.md`](cargo-remote-build-skill/SKILL.md). Install
+it by copying that directory into your agent's skills root; it contains no
+hosting-provider specifics.
+
+Minimum supported Rust version: **1.86** (edition 2021), which is what
+`cargo_metadata` 0.23 requires and what CI pins.
 
 ## License
 
