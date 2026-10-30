@@ -38,6 +38,9 @@ for arg in "$@"; do
     printf ' %s' "$arg" >> "{log}"
 done
 printf '\n' >> "{log}"
+case "$*" in
+    *"test -d"*) exit 1 ;;
+esac
 exit {exit_code}
 "#,
                 log = log.display(),
@@ -302,6 +305,13 @@ fn copy_back_can_select_a_single_artifact() {
     ]));
     let rsync = harness.rsync_command(1);
     assert!(rsync.contains("/target/release/demo"), "{rsync}");
+    // A single artifact is a file, so the source must not carry a trailing
+    // slash: that asserts a directory and fails the transfer with ENOTDIR.
+    let source = rsync
+        .split_whitespace()
+        .find(|w| w.contains("/target/release/demo"))
+        .unwrap();
+    assert!(!source.ends_with('/'), "{rsync}");
 }
 
 #[test]
@@ -838,4 +848,81 @@ fn every_lane_being_busy_is_reported_with_knobs() {
         "{stderr}"
     );
     assert!(stderr.contains("--lane"), "{stderr}");
+}
+
+#[test]
+fn copy_back_of_a_directory_uses_the_trailing_slash_form() {
+    // The counterpart to the single-artifact case: a directory path must be
+    // copied as its *contents*, so a repeated `-c=debug` cannot nest.
+    let bin = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+
+    let log = bin.path().join("commands.log");
+    let ssh = bin.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+printf 'ssh' >> "{log}"
+for arg in "$@"; do printf ' %s' "$arg" >> "{log}"; done
+printf '\n' >> "{log}"
+case "$*" in
+    *"test -d"*) exit 0 ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&ssh);
+    let rsync = bin.path().join("rsync");
+    std::fs::write(
+        &rsync,
+        format!(
+            "#!/bin/sh\nprintf 'rsync' >> \"{log}\"\nfor arg in \"$@\"; do printf ' %s' \"$arg\" >> \"{log}\"; done\nprintf '\\n' >> \"{log}\"\nexit 0\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&rsync);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args(["remote-3000", "-H", "user@build-host", "-c=debug", "build"])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", bin.path())
+        .env("HOME", bin.path())
+        .env("APPDATA", bin.path())
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let copy_back = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("rsync "))
+        .nth(1)
+        .expect("a copy-back rsync")
+        .to_string();
+    let source = copy_back
+        .split_whitespace()
+        .find(|w| w.contains("/target/debug/"))
+        .expect("a remote source path");
+    assert!(
+        source.ends_with('/'),
+        "a directory copy needs a trailing slash: {copy_back}"
+    );
+    assert!(
+        copy_back.trim_end().ends_with("/debug/"),
+        "the local destination must end with a slash too: {copy_back}"
+    );
 }

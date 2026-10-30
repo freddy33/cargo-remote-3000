@@ -228,24 +228,73 @@ impl Session<'_> {
         cmd.arg("--exclude").arg(".fingerprint/");
         cmd.arg("--exclude").arg("incremental/");
 
-        // An empty `relative` means "the whole target directory". Only add the
-        // separator when there is something to put after it.
+        // An empty `relative` means "the whole target directory". Anything else
+        // is either a directory (copy its contents) or a single artifact (copy
+        // the file itself), and rsync needs to be told which: a trailing slash
+        // asserts a directory and fails with ENOTDIR on a binary.
         let relative = relative.trim_matches('/');
         let (remote_path, local_path) = if relative.is_empty() {
             (
                 format!("{}:{}/", self.remote.host, remote_target),
                 format!("{}/", self.local_target_dir.display()),
             )
-        } else {
+        } else if self.remote_is_dir(&format!("{remote_target}/{relative}"))? {
             (
                 format!("{}:{}/{}/", self.remote.host, remote_target, relative),
                 format!("{}/{}/", self.local_target_dir.display(), relative),
+            )
+        } else {
+            let local = self.local_target_dir.join(relative);
+            // rsync will not create intermediate directories for a single file.
+            if let Some(parent) = local.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create the local directory {}", parent.display())
+                })?;
+            }
+            (
+                format!("{}:{}/{}", self.remote.host, remote_target, relative),
+                local.display().to_string(),
             )
         };
         cmd.arg(remote_path);
         cmd.arg(local_path);
 
         self.run(&mut cmd, "copy the target directory back")
+    }
+
+    /// True when `path` is a directory on the build server.
+    ///
+    /// `--copy-back` needs the answer to choose between "copy these contents"
+    /// and "copy this file", and guessing wrong fails the transfer: a trailing
+    /// slash on a file is `ENOTDIR`, and no trailing slash on an existing
+    /// directory nests it inside itself on the next run.
+    fn remote_is_dir(&self, path: &str) -> Result<bool> {
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.remote.ssh_args());
+        if !self
+            .remote
+            .ssh_options
+            .iter()
+            .any(|option| option.starts_with("LogLevel="))
+        {
+            cmd.arg("-o").arg("LogLevel=ERROR");
+        }
+        cmd.arg(&self.remote.host)
+            .arg(format!("test -d {}", shell_quote(path)));
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if self.verbose {
+            debug!("running: {cmd:?}");
+        }
+        // `test -d` exits 1 for "not a directory". A failed ssh (255) also lands
+        // here and surfaces as a transfer error below, which is accurate enough:
+        // the artifact could not be located.
+        Ok(cmd
+            .status()
+            .with_context(|| format!("failed to run `ssh` to {}", self.remote.host))?
+            .success())
     }
 
     /// Copy the workspace `Cargo.lock` back, if the remote produced one.
