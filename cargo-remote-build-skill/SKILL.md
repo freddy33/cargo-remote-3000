@@ -139,7 +139,10 @@ keep in sync and nothing to switch before a build.
   the config list. Pin the lane (`lane` in the config, or `--lane default`); an
   unnamed build that finds `default` busy moves to `default-2` and will not see
   that cache. The tree is `<temp_dir>/lanes/<lane>/<16-digit-hex>/`, not the
-  decimal directory used by cargo-remote 0.2.0.
+  decimal directory used by cargo-remote 0.2.0. Print it with
+  `cargo remote-3000 --lane default --print-build-root` (stdout is only that
+  path; no ssh). The lane must be explicit, because this command cannot see
+  which free lane the server would have chosen.
 - **The config `env` key is a list of files to source, not `KEY=VALUE`.** Setting
   it to a variable name replaces `~/.cargo/env` and every build then fails with
   `cargo: command not found`. Use `-b KEY=value` for variables.

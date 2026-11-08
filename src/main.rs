@@ -102,6 +102,19 @@ fn run() -> Outcome {
     // want, so it is kept and waited for. Without one, the server is asked for a
     // free lane and the build moves rather than queues.
     let requested = requested_lane(&args, &remote).map_err(|e| Failure::new(exit::USAGE, e))?;
+
+    // Resolve and print before any transfer. `Project::resolve` has already
+    // read the local manifest (the same project root a build would hash).
+    // Nothing below this point runs: no ssh, no rsync, no remote cargo.
+    if args.print_build_root {
+        let lane = explicit_print_lane(requested).map_err(|e| Failure::new(exit::USAGE, e))?;
+        println!(
+            "{}",
+            persistent_build_root(&remote.temp_dir, &lane, project.project_root())
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let run_id = lane::run_id();
 
     // A watch session owns its lane for as long as it runs, so it waits for it
@@ -137,7 +150,11 @@ fn run() -> Outcome {
     let mut attempts = 0usize;
     let status = loop {
         let status = session
-            .build(&args.build_env, &args.command, &args.args)
+            .build(
+                &args.build_env,
+                args.command.as_deref().expect("cargo command"),
+                &args.args,
+            )
             .map_err(|error| Failure::new(exit::TRANSFER, error))?;
 
         if status.code() != Some(BUSY_EXIT as i32) || requested.is_some() {
@@ -208,7 +225,7 @@ fn make_session<'a>(
     wait_for_lane: bool,
     args: &RemoteArgs,
 ) -> Session<'a> {
-    let build_root = lane::lane_root(&remote.temp_dir, lane, project_hash);
+    let build_root = persistent_build_root(&remote.temp_dir, lane, project.project_root());
     Session {
         remote,
         project_root: project.project_root(),
@@ -266,7 +283,11 @@ fn run_watch(args: &RemoteArgs, session: &Session) -> Outcome {
 
     let run_build = || -> Result<()> {
         session.upload()?;
-        let status = session.build(&args.build_env, &args.command, &args.args)?;
+        let status = session.build(
+            &args.build_env,
+            args.command.as_deref().unwrap(),
+            &args.args,
+        )?;
         if !status.success() {
             bail!("remote build failed with {status}");
         }
@@ -311,6 +332,32 @@ fn requested_lane(args: &RemoteArgs, remote: &config::Remote) -> Result<Option<S
     Ok(lane)
 }
 
+/// Persistent lane directory a build with this lane would use.
+///
+/// `temp_dir` is not expanded. A `~/...` value stays in the string so the
+/// caller can treat it as a path on the build server.
+fn persistent_build_root(temp_dir: &str, lane: &str, project_root: &Path) -> String {
+    lane::lane_root(temp_dir, lane, &lane::project_hash(project_root))
+}
+
+/// `--print-build-root` can only name a lane the caller asked for.
+///
+/// An automatic build asks the server which of `default`, `default-2`, ... is
+/// free. This command does not open a connection, so that answer is unknowable.
+fn explicit_print_lane(requested: Option<String>) -> Result<String> {
+    requested.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--print-build-root needs an explicit lane (`--lane`, \
+             $CARGO_REMOTE_3000_LANE, or `lane` in the config). \
+             A build that names no lane takes the first free one \
+             (`default`, then `default-2`, ...), which depends on locks on \
+             the build server. This command does not contact the server, so \
+             it cannot know that lane. Pass `--lane default` to print the \
+             default tree."
+        )
+    })
+}
+
 /// Join a remote path fragment onto a remote base directory.
 fn join_remote(base: &str, relative: &Path) -> String {
     if relative.as_os_str().is_empty() {
@@ -333,6 +380,42 @@ mod tests {
         assert_eq!(
             join_remote("/remote/abc", Path::new("crates/foo")),
             "/remote/abc/crates/foo"
+        );
+    }
+
+    #[test]
+    fn print_root_matches_the_build_lane_root_and_keeps_spaces_and_tilde() {
+        let project = Path::new("/data/my project");
+        let printed = persistent_build_root("~/remote builds", "default", project);
+        let built = lane::lane_root("~/remote builds", "default", &lane::project_hash(project));
+        assert_eq!(printed, built);
+        assert!(printed.starts_with("~/remote builds/lanes/default/"));
+        assert!(!printed.contains('\n'));
+        // A different checkout, or the overflow lane a busy server would pick,
+        // is a different directory. Local resolution must not collapse them.
+        assert_ne!(
+            printed,
+            persistent_build_root("~/remote builds", "default-2", project)
+        );
+        assert_ne!(
+            printed,
+            persistent_build_root(
+                "~/remote builds",
+                "default",
+                Path::new("/data/other project")
+            )
+        );
+    }
+
+    #[test]
+    fn print_root_refuses_to_guess_an_automatic_lane() {
+        let err = explicit_print_lane(None).unwrap_err().to_string();
+        assert!(err.contains("--print-build-root"), "{err}");
+        assert!(err.contains("default-2"), "{err}");
+        assert!(err.contains("does not contact the server"), "{err}");
+        assert_eq!(
+            explicit_print_lane(Some("default".to_string())).unwrap(),
+            "default"
         );
     }
 }

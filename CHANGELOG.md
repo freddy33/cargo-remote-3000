@@ -13,6 +13,14 @@ Earlier releases are recorded by their git tags (`v0.1.0` … `v0.4.0`).
   `target/`) in place. Patterns are shell-quoted and a pattern that contains a
   control character is rejected.
 
+### Added
+
+- `--print-build-root` prints the persistent lane directory and exits. It uses
+  the same project path, `temp_dir`, and explicit lane as a build, does not
+  contact the server, and leaves a `~` in `temp_dir` unexpanded. Without an
+  explicit lane it errors, because a busy server may move the build from
+  `default` to `default-2`.
+
 ## 0.5.0 — concurrent builds
 
 Several builds can now share one build server without interfering and without

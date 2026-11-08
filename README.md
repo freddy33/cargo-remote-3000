@@ -204,6 +204,7 @@ command name is never mistaken for the copy-back path.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-l, --lane <NAME>` | any free lane | Independent build lane on the server |
+| `--print-build-root` | — | Print that lane's remote directory and exit. No ssh or rsync. Requires an explicit lane |
 | `--max-lanes <N>` | `8` | How many lanes one project may fan out to |
 | `--lock-timeout <SECS>` | `3600` | Wait for a named lane this long; `0` fails fast |
 
@@ -385,6 +386,24 @@ across Rust releases. It is not the decimal directory cargo-remote 0.2.0 used
 directly under `temp_dir`. A new run does not delete that old directory and does
 not reuse it. Set `lane = "default"` or pass `--lane default` so a later build
 does not move to `default-2` and miss the cache. `-v` prints the remote paths.
+
+To obtain the directory without a build:
+
+```bash
+cargo remote-3000 --lane default --print-build-root
+```
+
+```text
+~/remote-builds/lanes/default/0123456789abcdef
+```
+
+Stdout is that one path and nothing else. `~` is not expanded locally. The lane
+has to be explicit (`--lane`, `$CARGO_REMOTE_3000_LANE`, or `lane` in the
+config). With no lane, a build asks the server which of `default`, `default-2`,
+... is free. `--print-build-root` does not contact the server, so it exits with
+an error instead of guessing. It reads the local manifest to find the same
+project root a build would hash, and it does not run ssh, rsync, or a remote
+cargo command.
 
 > `-r` selects a remote **by name**; `-H` is the **host** itself. This matches
 > the original tool, though some older bug reports used `-r` as though it took

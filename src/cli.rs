@@ -194,9 +194,21 @@ pub struct Remote {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// The cargo subcommand executed on the remote host, e.g. `build` or `test`
-    #[arg(value_name = "COMMAND", required = true)]
-    pub command: String,
+    /// Print the persistent lane directory and exit
+    ///
+    /// Local only: no ssh, rsync, or remote cargo. Uses the same project path,
+    /// `temp_dir`, and lane as a build. An explicit lane is required (`--lane`,
+    /// `$CARGO_REMOTE_3000_LANE`, or `lane` in the config). Without one, a build
+    /// may move from `default` to `default-2` when the server lane is busy, and
+    /// this command cannot know which. A leading `~` in `temp_dir` is left for
+    /// the remote shell.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub print_build_root: bool,
+
+    /// The cargo subcommand executed on the remote host, e.g. `build` or `test`.
+    /// Not used with `--print-build-root`.
+    #[arg(value_name = "COMMAND", required_unless_present = "print_build_root")]
+    pub command: Option<String>,
 
     /// Arguments appended to the remote cargo invocation. Everything after the
     /// cargo command is passed through, so `--` is not required.
@@ -254,7 +266,7 @@ mod tests {
     #[test]
     fn bare_build_works() {
         let remote = parse(&["cargo", "remote-3000", "build"]);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert!(remote.args.is_empty());
     }
 
@@ -269,7 +281,7 @@ mod tests {
             "human",
             "--release",
         ]);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert_eq!(remote.args, ["--message-format", "human", "--release"]);
     }
 
@@ -282,7 +294,7 @@ mod tests {
     #[test]
     fn double_dash_is_not_duplicated_into_args() {
         let remote = parse(&["cargo", "remote-3000", "test", "--", "--release"]);
-        assert_eq!(remote.command, "test");
+        assert_eq!(remote.command.as_deref(), Some("test"));
         assert_eq!(remote.args, ["--release"]);
     }
 
@@ -304,7 +316,7 @@ mod tests {
         assert_eq!(remote.remote.ssh_port, Some(2222));
         assert_eq!(remote.copy_back, Some(Some(String::new())));
         assert!(remote.no_transfer_git);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert_eq!(remote.args, ["--release"]);
     }
 
@@ -361,6 +373,20 @@ mod tests {
     #[test]
     fn cargo_command_is_required() {
         assert!(Cli::try_parse_from(["cargo", "remote-3000"]).is_err());
+    }
+
+    #[test]
+    fn print_build_root_does_not_need_a_cargo_command() {
+        let remote = parse(&[
+            "cargo",
+            "remote-3000",
+            "--lane",
+            "default",
+            "--print-build-root",
+        ]);
+        assert!(remote.print_build_root);
+        assert_eq!(remote.remote.lane.as_deref(), Some("default"));
+        assert_eq!(remote.command, None);
     }
 
     #[test]
