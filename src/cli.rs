@@ -83,7 +83,13 @@ pub struct RemoteOpts {
     #[arg(short, long, value_name = "SCRIPT")]
     pub env: Vec<String>,
 
-    /// Exclude pattern passed to rsync when uploading sources. Repeatable.
+    /// rsync exclude pattern for the upload, the lane mirror, and copy-back.
+    ///
+    /// Repeatable. A matched path is not transferred, and `--delete` leaves it
+    /// in place on the destination. With no `-x`, the config file's `exclude`
+    /// list is used; passing `-x` replaces that list. `coil_cache/` matches a
+    /// directory of that name anywhere, including a project-root cache and
+    /// `target/coil_cache`.
     #[arg(short = 'x', long, value_name = "PATTERN")]
     pub exclude: Vec<String>,
 

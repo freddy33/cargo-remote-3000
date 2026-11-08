@@ -261,10 +261,16 @@ impl Config {
             } else {
                 opts.env.clone()
             },
-            exclude: if opts.exclude.is_empty() {
-                base.exclude.clone()
-            } else {
-                opts.exclude.clone()
+            exclude: {
+                let exclude = if opts.exclude.is_empty() {
+                    base.exclude.clone()
+                } else {
+                    opts.exclude.clone()
+                };
+                for pattern in &exclude {
+                    validate_exclude_pattern(pattern)?;
+                }
+                exclude
             },
             lane: opts.lane.clone().or_else(|| base.lane.clone()),
             // Resolved here, so every `Remote` in the program carries a
@@ -417,6 +423,33 @@ pub fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Single-quote a string so a POSIX shell cannot expand, split, or execute it.
+///
+/// Unlike [`shell_quote`], a leading `~` is quoted too. rsync exclude patterns
+/// are data, not paths the remote shell should expand.
+pub fn shell_quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Reject exclude patterns that cannot be passed to rsync as a single text rule.
+///
+/// Patterns are interpolated into the remote shell script. Control characters
+/// would break that script even inside quotes, so they are refused before any
+/// transfer starts. Spaces, quotes, globs and anchored paths are allowed and
+/// quoted at the point of use.
+pub fn validate_exclude_pattern(pattern: &str) -> Result<()> {
+    if pattern.is_empty() {
+        bail!("exclude pattern must not be empty");
+    }
+    if pattern.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        bail!(
+            "exclude pattern {pattern:?} contains a control character; \
+             rsync patterns are matched as text"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -696,5 +729,42 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_quote_literal_never_leaves_metacharacters_for_the_shell() {
+        assert_eq!(shell_quote_literal("coil_cache/"), "'coil_cache/'");
+        assert_eq!(shell_quote_literal("my cache/"), "'my cache/'");
+        assert_eq!(shell_quote_literal("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote_literal("~/.ssh"), "'~/.ssh'");
+        assert_eq!(shell_quote_literal("$(id)"), "'$(id)'");
+        assert_eq!(shell_quote_literal("*.keep"), "'*.keep'");
+    }
+
+    #[test]
+    fn a_control_character_in_an_exclude_is_rejected() {
+        let conf = remote_from("[[remote]]\nhost = \"h\"\nexclude = [\"bad\\npattern\"]\n");
+        let err = conf
+            .get_remote(&RemoteOpts::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn cli_exclude_replaces_the_config_list() {
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            exclude = ["from-config/"]
+            "#,
+        );
+        let opts = RemoteOpts {
+            exclude: vec!["from-cli/".to_string()],
+            ..Default::default()
+        };
+        let remote = conf.get_remote(&opts).unwrap();
+        assert_eq!(remote.exclude, ["from-cli/"]);
     }
 }

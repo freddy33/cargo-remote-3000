@@ -195,7 +195,7 @@ command name is never mistaken for the copy-back path.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-t, --temp-dir <DIR>` | `~/remote-builds` | Remote directory holding per-project build dirs |
-| `-x, --exclude <PATTERN>` | — | rsync exclude pattern for the upload. Repeatable |
+| `-x, --exclude <PATTERN>` | config `exclude` | rsync exclude for the upload, the lane mirror, and copy-back. Repeatable. `-x` replaces the config list |
 | `--transfer-hidden` | off | Upload dotfiles, including `.git` |
 | `--no-transfer-git` | off | Never upload `.git`, even with `--transfer-hidden` |
 
@@ -320,7 +320,7 @@ host = "me@laptop.example"     # or an ssh config Host entry
 ssh_port = 22
 temp_dir = "~/remote-builds"
 env = "~/.cargo/env"
-exclude = ["assets/", "*.png"]
+exclude = ["assets/", "*.png", "coil_cache/"]
 toolchain = "1.95.0"           # optional pin; omit to use the server default
 lane = "alice"                # optional: always build in this lane
 max_lanes = 8                  # optional: how far automatic lanes may fan out
@@ -339,6 +339,52 @@ Only `host` is required. Anything omitted falls back to a default, and every
 field can be overridden on the command line. An unknown key is ignored rather
 than rejected, so a misspelled pin reads like a guarantee and pins nothing —
 check with `-v` when a setting seems to have no effect.
+
+### Excluding a path, including from `--delete`
+
+`-x` and the config `exclude` list are ordinary rsync patterns. They are applied
+to all three transfers:
+
+- the upload into the per-run staging directory
+- the mirror from that stage onto the persistent lane (`rsync --delete`)
+- copy-back, whether that is the whole `target/` or one path such as `cli_db/`
+
+`--delete` still removes a file that is not excluded and is absent from the
+source. That is how deleted source files and test data disappear from the lane
+and from a copied-back directory. An excluded path is left as it already is on
+the destination: it is not uploaded, not downloaded, and not deleted.
+
+Passing `-x` one or more times replaces the config list. With no `-x`, the
+merged config list is used. A project `exclude` replaces the user-level list
+for that remote when it is non-empty. Patterns are quoted for the remote shell
+and rejected when they contain control characters. An empty pattern is rejected.
+
+`coil_cache/` is not special to the tool. It is the pattern to use when a
+directory of that name must be left alone wherever it sits, including a
+project-root `coil_cache/` and `target/coil_cache/`. The trailing slash limits
+the match to directories. `/coil_cache/` is anchored to the root of *that
+transfer*. Upload and the lane mirror are rooted at the project tree, so the
+anchored form matches only the project-root cache there. Copy-back is rooted at
+`target/` (or at the subdirectory named by `--copy-back`), so the same anchored
+pattern matches a different path. Prefer the unanchored `coil_cache/` when both
+locations must be skipped on every transfer.
+
+```bash
+cargo remote-3000 --lane default --copy-back=cli_db/ \
+  --build-env RUST_LOG=info --build-env RUST_BACKTRACE=full \
+  -- build --release
+```
+
+`--copy-back` takes its path with `=`. `--copy-back=cli_db/` syncs only that
+subdirectory of `target/`, so a sibling `target/coil_cache/` and a project-root
+`coil_cache/` are outside the transfer. `--build-env` is repeatable, one
+`KEY=value` per flag. The lane that holds the cache is
+`<temp_dir>/lanes/<lane>/<16-digit-hex>/` (`~/remote-builds` and `default` unless
+you change them). The hex is a hash of the local project path and is not stable
+across Rust releases. It is not the decimal directory cargo-remote 0.2.0 used
+directly under `temp_dir`. A new run does not delete that old directory and does
+not reuse it. Set `lane = "default"` or pass `--lane default` so a later build
+does not move to `default-2` and miss the cache. `-v` prints the remote paths.
 
 > `-r` selects a remote **by name**; `-H` is the **host** itself. This matches
 > the original tool, though some older bug reports used `-r` as though it took
@@ -443,19 +489,23 @@ Each run then does four things:
    lane, never with a wait.
 2. **Upload** — `rsync --delete` the project tree into
    `<temp_dir>/incoming/<hash>/<run-id>/`, skipping `target/`, hidden files
-   (unless `--transfer-hidden`) and any `-x` patterns. rsync shells out to ssh
-   with the same port, identity file and options you passed. The stage is outside
-   every lane, so concurrent uploads cannot overwrite each other and a build that
-   changes lanes keeps its upload.
+   (unless `--transfer-hidden`) and any exclude patterns. Excluded files already
+   on the destination are not deleted. rsync shells out to ssh with the same
+   port, identity file and options you passed. The stage is outside every lane,
+   so concurrent uploads cannot overwrite each other and a build that changes
+   lanes keeps its upload.
 3. **Build** — one ssh invocation running a small POSIX shell script that takes an
-exclusive `flock` on the lane, mirrors the stage into it, sources the `env`
-   scripts, selects the toolchain for that process only, `cd`s into the crate and
-   runs `cargo <command> <args>`. Arguments are shell-quoted, and the build's exit
-   status is propagated back to your shell.
-4. **Copy back** — optionally `rsync` the target directory (or one path in it)
-   home, skipping `deps/`, `build/`, `.fingerprint/` and `incremental/`, which
-   are either regenerated locally or large enough to dominate transfer time.
-   `Cargo.lock` comes back too unless you pass `--no-copy-lock`.
+   exclusive `flock` on the lane, mirrors the stage into it with `rsync
+   --delete` (again skipping `target/` and the same exclude patterns, so a remote
+   cache that was never uploaded is not removed), sources the `env` scripts,
+   selects the toolchain for that process only, `cd`s into the crate and runs
+   `cargo <command> <args>`. Arguments and exclude patterns are shell-quoted, and
+   the build's exit status is propagated back to your shell.
+4. **Copy back** — optionally `rsync --delete` the target directory (or one path
+   in it) home, skipping `deps/`, `build/`, `.fingerprint/`, `incremental/`, and
+   the same exclude patterns. A pattern such as `coil_cache/` therefore does not
+   come home and is not deleted locally. `Cargo.lock` comes back too unless you
+   pass `--no-copy-lock`.
 
 Everything the tool needs from the build server is ssh, `rsync`, `flock` and
 `cargo`. There is no daemon, no agent, and no state beyond the directories under

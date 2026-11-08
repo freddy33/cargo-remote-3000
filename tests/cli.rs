@@ -258,6 +258,89 @@ fn sources_are_uploaded_with_the_expected_excludes() {
 }
 
 #[test]
+fn exclude_patterns_protect_the_lane_mirror_and_copy_back() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&[
+        "-H",
+        "user@build-host",
+        "-x",
+        "coil_cache/",
+        "-x",
+        "my cache/",
+        "-c",
+        "build",
+    ]));
+
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude coil_cache/"), "{upload}");
+    assert!(upload.contains("--exclude my cache/"), "{upload}");
+
+    let copy_back = harness.rsync_command(1);
+    assert!(copy_back.contains("--exclude coil_cache/"), "{copy_back}");
+    assert!(copy_back.contains("--exclude my cache/"), "{copy_back}");
+    assert!(copy_back.contains("--exclude deps/"), "{copy_back}");
+
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='coil_cache/'"), "{ssh}");
+    assert!(ssh.contains("--exclude='my cache/'"), "{ssh}");
+    assert!(
+        ssh.contains("--exclude='target'"),
+        "the built-in target exclude must stay on the mirror: {ssh}"
+    );
+}
+
+#[test]
+fn config_exclude_is_used_when_the_cli_does_not_replace_it() {
+    let harness = Harness::new();
+    std::fs::write(
+        harness.project_dir().join(".cargo-remote.toml"),
+        "[[remote]]\nhost = \"me@legacy\"\nexclude = [\"coil_cache/\"]\n",
+    )
+    .unwrap();
+
+    assert_success(&harness.run(&["build"]));
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude coil_cache/"), "{upload}");
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='coil_cache/'"), "{ssh}");
+    assert!(ssh.contains("me@legacy"), "{ssh}");
+}
+
+#[test]
+fn a_cli_exclude_replaces_the_config_list_everywhere() {
+    let harness = Harness::new();
+    std::fs::write(
+        harness.project_dir().join(".cargo-remote-3000.toml"),
+        "[[remote]]\nhost = \"me@host\"\nexclude = [\"from-config/\"]\n",
+    )
+    .unwrap();
+
+    assert_success(&harness.run(&["-x", "from-cli/", "build"]));
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude from-cli/"), "{upload}");
+    assert!(
+        !upload.contains("from-config"),
+        "CLI -x replaces the config list: {upload}"
+    );
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='from-cli/'"), "{ssh}");
+    assert!(!ssh.contains("from-config"), "{ssh}");
+}
+
+#[test]
+fn a_control_character_exclude_is_rejected_before_any_transfer() {
+    let harness = Harness::new();
+    let output = harness.run(&["-H", "user@build-host", "-x", "bad\npattern", "build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("control character"), "{stderr}");
+    assert!(
+        harness.commands().is_empty(),
+        "a rejected pattern must not start rsync or ssh"
+    );
+}
+
+#[test]
 fn transfer_hidden_opts_in_to_dot_files() {
     let harness = Harness::new();
     assert_success(&harness.run(&["-H", "user@build-host", "--transfer-hidden", "build"]));

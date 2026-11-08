@@ -2,6 +2,17 @@
 
 Earlier releases are recorded by their git tags (`v0.1.0` … `v0.4.0`).
 
+## Unreleased
+
+### Fixed
+
+- Exclude patterns from `-x` and from `exclude` in the config are applied to the
+  lane mirror and to copy-back, not only to the upload. `rsync --delete` still
+  removes other files that are gone from the source, and it leaves an excluded
+  path (for example a remote `coil_cache/`, at the project root or under
+  `target/`) in place. Patterns are shell-quoted and a pattern that contains a
+  control character is rejected.
+
 ## 0.5.0 — concurrent builds
 
 Several builds can now share one build server without interfering and without
