@@ -186,7 +186,8 @@ command name is never mistaken for the copy-back path.
 | --- | --- | --- |
 | `-d, --rustup-default, --toolchain <TOOLCHAIN>` | host default | Toolchain for this build only; see [Toolchains](#toolchains) |
 | `-b, --build-env <VARS>` | `RUST_BACKTRACE=1` | Remote environment variables. Repeatable |
-| `-e, --env <SCRIPT>` | `~/.cargo/env` | Script sourced before the build. Repeatable |
+| `-e, --env <SCRIPT>` | `~/.cargo/env` | Extra script sourced after the login-shell `PATH` import. Repeatable. Replaces the config list |
+| `--no-shell-env` | shell env on | Do not import `PATH` from the remote user's login shell |
 | `--manifest-path <PATH>` | `Cargo.toml` | Manifest to build |
 | `-w, --working-directory <DIR>` | workspace root | Directory to upload; must contain the workspace |
 
@@ -220,7 +221,7 @@ command name is never mistaken for the copy-back path.
 | Option | Description |
 | --- | --- |
 | `-W, --watch` | Rebuild on source changes until interrupted |
-| `-v, --verbose` | Log every rsync and ssh invocation |
+| `-v, --verbose` | Show rsync progress and log every rsync and ssh invocation |
 | `-h, --help` | Show help |
 | `-V, --version` | Show version |
 
@@ -425,17 +426,27 @@ With exactly one configured remote the name can be omitted entirely. Passing
 
 ### Environment setup on the build server
 
-The default `env` is `~/.cargo/env`, the file rustup's own installer writes.
-Before each build, cargo-remote-3000 runs:
+`ssh host command` does not start a login shell, so the `PATH` you see in an
+interactive session (CUDA's `nvcc`, for example) is missing. Before the build,
+cargo-remote-3000 asks the remote user's own `$SHELL` to start a login
+interactive shell and print `PATH`. That runs `/etc/profile` and the shell's
+user startup (`.profile`, `.bash_profile`, `.bashrc`, `.zshrc`, whichever that
+shell actually reads). The script is not sourced with `sh`, and the shell is
+not assumed to be bash. fish and csh are left alone. Chatter from that startup
+is kept off the build's stdout; stderr from a failed probe is shown.
+
+`~/.cargo/env` is then sourced when it exists, which is what puts `cargo` on
+`PATH` when the profile does not. `-e` replaces that file list and still runs
+after the `PATH` import. It does not turn the import off. `--no-shell-env`, or
+`shell_env = false` in the config, skips the import and sources only the `env`
+files. A leading `~` in those paths is expanded by the remote shell.
 
 ```sh
 [ -f ~/.cargo/env ] && . ~/.cargo/env
 ```
 
-Note the `.` rather than bash's `source`, and the existence check. A build
-server running `dash`, or any shell without the `source` builtin, silently ran
-the build with no environment at all before this was fixed. Add more scripts by
-repeating `-e`:
+The `.` is POSIX. `source` is not, and on a `dash` host it used to skip the
+rest of the environment. Add more scripts by repeating `-e`:
 
 ```bash
 cargo remote-3000 -e /etc/profile -e ~/.profile -e ~/.cargo/env build

@@ -53,6 +53,8 @@ pub struct Remote {
     pub ssh_options: Vec<String>,
     pub temp_dir: String,
     pub env: Vec<String>,
+    /// When true, import `PATH` from the remote user's login shell before `env`.
+    pub shell_env: bool,
     pub exclude: Vec<String>,
     /// Independent build lane, or `None` for the shared default lane.
     pub lane: Option<String>,
@@ -84,6 +86,9 @@ struct PartialRemote {
     temp_dir: Option<String>,
     #[serde(default)]
     env: Option<EnvSpec>,
+    /// `false` skips the login-shell PATH import. Omitted means import it.
+    #[serde(default)]
+    shell_env: Option<bool>,
     #[serde(default)]
     exclude: Vec<String>,
     #[serde(default)]
@@ -261,6 +266,11 @@ impl Config {
             } else {
                 opts.env.clone()
             },
+            shell_env: if opts.no_shell_env {
+                false
+            } else {
+                base.shell_env.unwrap_or(true)
+            },
             exclude: {
                 let exclude = if opts.exclude.is_empty() {
                     base.exclude.clone()
@@ -326,6 +336,7 @@ static EMPTY_REMOTE: PartialRemote = PartialRemote {
     ssh_options: Vec::new(),
     temp_dir: None,
     env: None,
+    shell_env: None,
     exclude: Vec::new(),
     lane: None,
     toolchain: None,
@@ -358,6 +369,7 @@ impl PartialRemote {
         }
         self.temp_dir = other.temp_dir.or(self.temp_dir.take());
         self.env = other.env.or(self.env.take());
+        self.shell_env = other.shell_env.or(self.shell_env.take());
         if !other.exclude.is_empty() {
             self.exclude = other.exclude;
         }
@@ -515,6 +527,39 @@ mod tests {
         assert_eq!(remote.temp_dir, "/var/tmp/rust");
         assert_eq!(remote.env, ["~/.cargo/env"]);
         assert_eq!(remote.exclude, ["assets/"]);
+    }
+
+    #[test]
+    fn shell_env_defaults_on_and_can_be_disabled() {
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            "#,
+        );
+        assert!(conf.get_remote(&RemoteOpts::default()).unwrap().shell_env);
+
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            shell_env = false
+            "#,
+        );
+        assert!(!conf.get_remote(&RemoteOpts::default()).unwrap().shell_env);
+
+        let opts = RemoteOpts {
+            no_shell_env: true,
+            ..Default::default()
+        };
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            shell_env = true
+            "#,
+        );
+        assert!(!conf.get_remote(&opts).unwrap().shell_env);
     }
 
     #[test]
@@ -688,6 +733,7 @@ mod tests {
             ssh_options: vec![],
             temp_dir: "~/remote-builds".into(),
             env: vec![],
+            shell_env: true,
             exclude: vec![],
             lane: None,
             toolchain: None,
@@ -707,6 +753,7 @@ mod tests {
             ssh_options: vec!["ProxyJump=bastion".into()],
             temp_dir: DEFAULT_TEMP_DIR.into(),
             env: vec![],
+            shell_env: true,
             exclude: vec![],
             lane: None,
             toolchain: None,

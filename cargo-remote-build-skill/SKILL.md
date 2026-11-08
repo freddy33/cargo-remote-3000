@@ -145,7 +145,10 @@ keep in sync and nothing to switch before a build.
   which free lane the server would have chosen.
 - **The config `env` key is a list of files to source, not `KEY=VALUE`.** Setting
   it to a variable name replaces `~/.cargo/env` and every build then fails with
-  `cargo: command not found`. Use `-b KEY=value` for variables.
+  `cargo: command not found`. Use `-b KEY=value` for variables. `env` is sourced
+  after the remote user's login-shell `PATH` (so `nvcc` from that startup remains).
+  `--no-shell-env` or `shell_env = false` skips that import. rsync is quiet unless
+  `-v` is passed.
 - **A toolchain key is honoured, a typo is not.** An unknown key in the config is
   silently ignored, so a pin that lives in a misspelled field reads like a
   guarantee and pins nothing. Verify with `-v`.

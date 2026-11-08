@@ -397,6 +397,43 @@ fn print_build_root_rejects_an_invalid_lane_before_any_transfer() {
 }
 
 #[test]
+fn transfers_are_quiet_unless_verbose_is_requested() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "-c", "build"]));
+    for line in harness
+        .commands()
+        .iter()
+        .filter(|line| line.starts_with("rsync "))
+    {
+        assert!(line.contains("--partial"), "{line}");
+        assert!(!line.contains("--progress"), "{line}");
+        assert!(!line.contains("-P"), "{line}");
+    }
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("rsync -a --partial --delete"), "{ssh}");
+    assert!(!ssh.contains("--progress"), "{ssh}");
+    assert!(ssh.contains("\"$SHELL\" -ilc"), "{ssh}");
+
+    let verbose = Harness::new();
+    assert_success(&verbose.run(&["-H", "user@build-host", "-v", "-c", "build"]));
+    assert!(verbose.rsync_command(0).contains("--progress"));
+    assert!(verbose.rsync_command(1).contains("--progress"));
+    assert!(verbose.ssh_command().contains("--progress"));
+}
+
+#[test]
+fn no_shell_env_skips_the_login_path_probe() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "--no-shell-env", "build"]));
+    let ssh = harness.ssh_command();
+    assert!(!ssh.contains("-ilc"), "{ssh}");
+    assert!(
+        ssh.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env"),
+        "{ssh}"
+    );
+}
+
+#[test]
 fn builds_with_a_host_on_the_command_line() {
     let harness = Harness::new();
     let output = harness.run(&["-H", "user@build-host", "build"]);

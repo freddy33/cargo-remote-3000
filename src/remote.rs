@@ -361,9 +361,15 @@ impl Session<'_> {
 
         let mut script = String::new();
 
+        if self.remote.shell_env {
+            script.push_str(user_shell_env_script());
+        }
+
         // Issue #26: `source` is not POSIX, so on a dash/sh build host it fails
         // and the rest of the line runs without the environment set up. `.` is
         // portable, and the file is only sourced when it actually exists.
+        // These files run after the login-shell PATH import, so `-e` adds or
+        // replaces scripts without discarding `nvcc` from the user's profile.
         for script_path in &self.remote.env {
             script.push_str(&format!(
                 "[ -f {path} ] && . {path}; ",
@@ -404,7 +410,8 @@ impl Session<'_> {
         // them would remove the copies that already live on the lane (a remote
         // `coil_cache/`, for example). `--delete` still removes everything else
         // that the stage does not have.
-        let mirror = lane_mirror_rsync(&self.stage_root, root, &self.upload_excludes)?;
+        let mirror =
+            lane_mirror_rsync(&self.stage_root, root, &self.upload_excludes, self.verbose)?;
         script.push_str(&format!(
             "if ! {mirror}; then echo {msg} >&2; exit 4; fi; rm -rf {stage}; ",
             stage = shell_quote(&self.stage_root),
@@ -585,11 +592,17 @@ impl Session<'_> {
     /// Base rsync invocation with flags shared by every transfer.
     fn rsync_command(&self) -> Command {
         let mut cmd = Command::new("rsync");
-        // `-a` preserves permissions and times, `-P` keeps partial transfers
-        // resumable and shows per-file progress. `-P` is deliberately used
-        // instead of `--info=progress2`, which only exists in rsync >= 3.1 and
-        // made the BSD rsync shipped with macOS fail outright (issue #2).
-        cmd.arg("-aP").arg("--compress").arg("--safe-links");
+        // `-a` preserves permissions and times. `--partial` keeps an interrupted
+        // transfer resumable without `--progress`, which prints one line per
+        // file. Progress is opt-in via `-v`. `--info=progress2` is not used: the
+        // rsync shipped with macOS does not have it (issue #2).
+        cmd.arg("-a")
+            .arg("--partial")
+            .arg("--compress")
+            .arg("--safe-links");
+        if self.verbose {
+            cmd.arg("--progress");
+        }
         cmd.arg("-e").arg(self.remote.rsync_ssh_command());
         cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::inherit());
@@ -625,11 +638,18 @@ impl Session<'_> {
 /// cannot be parsed as another rsync flag or as shell syntax. The trailing
 /// slashes are outside the quotes on purpose: `'path with spaces'/` is one
 /// shell word whose value ends in `/`.
-fn lane_mirror_rsync(stage: &str, root: &str, excludes: &[String]) -> Result<String> {
-    let mut cmd = format!(
-        "rsync -a --delete --exclude={}",
-        shell_quote_literal("target")
-    );
+fn lane_mirror_rsync(
+    stage: &str,
+    root: &str,
+    excludes: &[String],
+    verbose: bool,
+) -> Result<String> {
+    let mut cmd = String::from("rsync -a --partial");
+    if verbose {
+        cmd.push_str(" --progress");
+    }
+    cmd.push_str(" --delete --exclude=");
+    cmd.push_str(&shell_quote_literal("target"));
     for pattern in excludes {
         validate_exclude_pattern(pattern)?;
         cmd.push_str(" --exclude=");
@@ -641,6 +661,24 @@ fn lane_mirror_rsync(stage: &str, root: &str, excludes: &[String]) -> Result<Str
     cmd.push_str(&shell_quote(root));
     cmd.push('/');
     Ok(cmd)
+}
+
+/// Import `PATH` from the remote user's own login shell, then return to this script.
+///
+/// `ssh host command` starts a non-interactive, non-login shell, so it does not
+/// read `.profile` or the interactive rc where a user normally adds `nvcc`.
+/// Asking `$SHELL -ilc` to print `PATH` runs that startup in the user's shell
+/// (bash, zsh, or dash), not by sourcing an rc file with `sh`. fish and csh are
+/// skipped: they cannot execute the rest of this POSIX script.
+///
+/// Startup chatter goes to `/dev/null`. The probe's stderr is shown only when
+/// the probe fails, so a missing shell is visible and the usual "no job control"
+/// warning is not. `~/.cargo/env` and any `-e` files are sourced afterwards by
+/// the caller, which is what puts `cargo` on `PATH` when the profile does not.
+fn user_shell_env_script() -> &'static str {
+    // One line on purpose: the end-to-end harness records each ssh argument as
+    // a single log line, and a newline would hide the rest of the script.
+    r#"_cargo_remote_path=; case "${SHELL:-}" in *fish*|*csh|*tcsh) ;; *) if [ -n "${SHELL:-}" ] && [ -x "${SHELL:-}" ]; then _cargo_remote_err=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/cargo-remote-3000-shell-env.$$"); _cargo_remote_path=$("$SHELL" -ilc 'exec 1>&3; printf %s "$PATH"' 3>&1 >/dev/null 2>"$_cargo_remote_err") || { cat "$_cargo_remote_err" >&2; _cargo_remote_path=; }; rm -f "$_cargo_remote_err"; fi ;; esac; if [ -n "$_cargo_remote_path" ]; then PATH=$_cargo_remote_path; export PATH; fi; unset _cargo_remote_path _cargo_remote_err; "#
 }
 
 /// Reject anything that is not a plain `KEY=value` assignment.
@@ -934,7 +972,9 @@ mod tests {
         let s = session(dir.path());
         let script = s.build_script(&[], "check", &[]).unwrap();
         let lease = script.find("flock -n 9").unwrap();
-        let mirror = script.find("rsync -a --delete --exclude='target'").unwrap();
+        let mirror = script
+            .find("rsync -a --partial --delete --exclude='target'")
+            .unwrap();
         assert!(lease < mirror, "lease must precede the mirror: {script}");
     }
 
@@ -946,7 +986,7 @@ mod tests {
         let s = session(dir.path());
         let script = s.build_script(&[], "check", &[]).unwrap();
         let mirror = script
-            .split("rsync -a --delete")
+            .split("rsync -a --partial --delete")
             .nth(1)
             .expect("a mirror step");
         assert!(mirror.starts_with(" --exclude='target' "), "{script}");
@@ -1083,8 +1123,13 @@ mod tests {
     }
 
     fn run_mirror(stage: &std::path::Path, lane: &std::path::Path, excludes: &[String]) {
-        let script =
-            lane_mirror_rsync(stage.to_str().unwrap(), lane.to_str().unwrap(), excludes).unwrap();
+        let script = lane_mirror_rsync(
+            stage.to_str().unwrap(),
+            lane.to_str().unwrap(),
+            excludes,
+            false,
+        )
+        .unwrap();
         let output = Command::new("sh")
             .arg("-c")
             .arg(&script)
@@ -1355,5 +1400,147 @@ mod tests {
             "local intermediate\n"
         );
         assert!(!local_target.join("deps/crate.rmeta").exists());
+    }
+
+    #[test]
+    fn quiet_rsync_omits_progress_until_verbose() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        s.verbose = false;
+        let quiet = format!("{:?}", s.rsync_command());
+        assert!(quiet.contains("--partial"), "{quiet}");
+        assert!(!quiet.contains("--progress"), "{quiet}");
+        assert!(!quiet.contains("-P"), "{quiet}");
+        s.verbose = true;
+        let verbose = format!("{:?}", s.rsync_command());
+        assert!(verbose.contains("--progress"), "{verbose}");
+
+        let quiet_mirror =
+            lane_mirror_rsync("/stage", "/lane", &["coil_cache/".into()], false).unwrap();
+        assert!(quiet_mirror.starts_with("rsync -a --partial --delete "));
+        assert!(!quiet_mirror.contains("--progress"), "{quiet_mirror}");
+        let verbose_mirror =
+            lane_mirror_rsync("/stage", "/lane", &["coil_cache/".into()], true).unwrap();
+        assert!(
+            verbose_mirror.contains("rsync -a --partial --progress --delete "),
+            "{verbose_mirror}"
+        );
+    }
+
+    #[test]
+    fn shell_env_can_be_turned_off_without_dropping_env_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        let on = s.build_script(&[], "build", &[]).unwrap();
+        assert!(on.contains("\"$SHELL\" -ilc"), "{on}");
+        assert!(
+            on.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env;"),
+            "{on}"
+        );
+        let remote = Box::leak(Box::new(Remote {
+            shell_env: false,
+            ..(*s.remote).clone()
+        }));
+        s.remote = remote;
+        let off = s.build_script(&[], "build", &[]).unwrap();
+        assert!(!off.contains("-ilc"), "{off}");
+        assert!(
+            off.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env;"),
+            "{off}"
+        );
+    }
+
+    #[test]
+    fn user_shell_path_reaches_cargo_and_stays_off_stdout() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(home.join("cuda/bin")).unwrap();
+        std::fs::write(
+            home.join(".cargo/env"),
+            "export PATH=\"$HOME/.cargo/bin:$PATH\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".bashrc"),
+            "case $- in\n  *i*) ;;\n  *) return ;;\nesac\nexport PATH=\"$HOME/cuda/bin:$PATH\"\necho bashrc-stdout\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".profile"),
+            "echo profile-stdout\nif [ -n \"$BASH_VERSION\" ]; then [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"; fi\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("cuda/bin/nvcc"), "#!/bin/sh\necho nvcc\n").unwrap();
+        std::fs::write(
+            home.join(".cargo/bin/cargo"),
+            "#!/bin/sh\nprintf 'NVCC=%s\\n' \"$(command -v nvcc || echo NO_NVCC)\"\nexit \"${CARGO_EXIT:-0}\"\n",
+        )
+        .unwrap();
+        for name in ["cuda/bin/nvcc", ".cargo/bin/cargo"] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let with_shell = format!(
+            "{}[ -f ~/.cargo/env ] && . ~/.cargo/env; cargo",
+            user_shell_env_script()
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&with_shell)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .output()
+            .expect("bash");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(&format!("NVCC={}/cuda/bin/nvcc", home.display())),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+        assert!(!stdout.contains("bashrc-stdout"), "{stdout}");
+        assert!(!stdout.contains("profile-stdout"), "{stdout}");
+        assert!(!stdout.contains("sudo"), "{stdout}");
+        assert!(!stderr.contains("no job control"), "{stderr}");
+
+        let without = "[ -f ~/.cargo/env ] && . ~/.cargo/env; cargo";
+        let bare = Command::new("bash")
+            .arg("-c")
+            .arg(without)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .output()
+            .unwrap();
+        let bare_out = String::from_utf8_lossy(&bare.stdout);
+        assert!(bare_out.contains("NVCC=NO_NVCC"), "{bare_out}");
+
+        let failing = Command::new("bash")
+            .arg("-c")
+            .arg(&with_shell)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .env("CARGO_EXIT", "9")
+            .output()
+            .unwrap();
+        assert_eq!(failing.status.code(), Some(9));
     }
 }

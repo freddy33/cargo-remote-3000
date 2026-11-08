@@ -80,8 +80,20 @@ pub struct RemoteOpts {
     pub temp_dir: Option<String>,
 
     /// Script sourced before the remote build, e.g. `~/.cargo/env`. Repeatable.
+    ///
+    /// Replaces the config `env` list. These files are sourced after the remote
+    /// user's login shell `PATH` has been imported. They do not replace that
+    /// import; `--no-shell-env` does.
     #[arg(short, long, value_name = "SCRIPT")]
     pub env: Vec<String>,
+
+    /// Do not import PATH from the remote user's login shell
+    ///
+    /// By default the build asks `$SHELL -ilc` for `PATH` (the same startup an
+    /// interactive login would use) and then sources `env`. This flag keeps only
+    /// the `env` scripts, which default to `~/.cargo/env`.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub no_shell_env: bool,
 
     /// rsync exclude pattern for the upload, the lane mirror, and copy-back.
     ///
@@ -190,7 +202,7 @@ pub struct Remote {
     #[arg(short = 'W', long, action = ArgAction::SetTrue)]
     pub watch: bool,
 
-    /// Log every rsync/ssh invocation instead of just progress
+    /// Show rsync progress and log every rsync and ssh invocation
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
