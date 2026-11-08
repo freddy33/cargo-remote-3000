@@ -130,10 +130,25 @@ keep in sync and nothing to switch before a build.
   before compiling anything. Use `-w <ancestor>` to upload a wider tree.
 - **`--copy-back` is expensive.** `-c` alone copies the whole target tree; prefer
   `-c=<path>` for one artifact. `deps/`, `build/`, `.fingerprint/` and
-  `incremental/` are never copied back.
+  `incremental/` are never copied back. The value is attached with `=`, as in
+  `--copy-back=cli_db/`.
+- **An exclude is honored on `--delete`.** `-x` and the config `exclude` list
+  apply to the upload, to the lane mirror, and to copy-back. Other missing files
+  are still deleted. `exclude = ["coil_cache/"]` leaves a directory of that name
+  alone at the project root and at `target/coil_cache`. Passing `-x` replaces
+  the config list. Pin the lane (`lane` in the config, or `--lane default`); an
+  unnamed build that finds `default` busy moves to `default-2` and will not see
+  that cache. The tree is `<temp_dir>/lanes/<lane>/<16-digit-hex>/`, not the
+  decimal directory used by cargo-remote 0.2.0. Print it with
+  `cargo remote-3000 --lane default --print-build-root` (stdout is only that
+  path; no ssh). The lane must be explicit, because this command cannot see
+  which free lane the server would have chosen.
 - **The config `env` key is a list of files to source, not `KEY=VALUE`.** Setting
   it to a variable name replaces `~/.cargo/env` and every build then fails with
-  `cargo: command not found`. Use `-b KEY=value` for variables.
+  `cargo: command not found`. Use `-b KEY=value` for variables. `env` is sourced
+  after the remote user's login-shell `PATH` (so `nvcc` from that startup remains).
+  `--no-shell-env` or `shell_env = false` skips that import. rsync is quiet unless
+  `-v` is passed.
 - **A toolchain key is honoured, a typo is not.** An unknown key in the config is
   silently ignored, so a pin that lives in a misspelled field reads like a
   guarantee and pins nothing. Verify with `-v`.

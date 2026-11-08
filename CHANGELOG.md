@@ -2,6 +2,35 @@
 
 Earlier releases are recorded by their git tags (`v0.1.0` … `v0.4.0`).
 
+## Unreleased
+
+### Fixed
+
+- Exclude patterns from `-x` and from `exclude` in the config are applied to the
+  lane mirror and to copy-back, not only to the upload. `rsync --delete` still
+  removes other files that are gone from the source, and it leaves an excluded
+  path (for example a remote `coil_cache/`, at the project root or under
+  `target/`) in place. Patterns are shell-quoted and a pattern that contains a
+  control character is rejected.
+
+### Added
+
+- `--print-build-root` prints the persistent lane directory and exits. It uses
+  the same project path, `temp_dir`, and explicit lane as a build, does not
+  contact the server, and leaves a `~` in `temp_dir` unexpanded. Without an
+  explicit lane it errors, because a busy server may move the build from
+  `default` to `default-2`.
+
+### Changed
+
+- rsync no longer passes `-P`, so uploads, the lane mirror, and copy-back do
+  not print a line per file. `-v` adds `--progress` and still logs the
+  commands. Errors from rsync are unchanged.
+- The remote build imports `PATH` from `$SHELL -ilc` before sourcing
+  `~/.cargo/env`, so a compiler such as `nvcc` that the user's login shell
+  puts on `PATH` is visible to `cargo`. `--no-shell-env` and `shell_env = false`
+  skip that import. `-e` still replaces only the list of sourced files.
+
 ## 0.5.0 — concurrent builds
 
 Several builds can now share one build server without interfering and without

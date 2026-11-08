@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
 
-use crate::config::{shell_quote, Remote};
+use crate::config::{shell_quote, shell_quote_literal, validate_exclude_pattern, Remote};
 use crate::lane;
 
 /// Exit code a remote build uses when the lane it was given is already leased.
@@ -185,20 +185,10 @@ impl Session<'_> {
         let mut cmd = self.rsync_command();
         // The stage is fresh for every run, but keep --delete so a retry after a
         // crashed upload cannot leave a stale file behind and have it compiled.
+        // Excluded paths are left in place: rsync does not delete them unless
+        // `--delete-excluded` is set, and this command never sets it.
         cmd.arg("--delete");
-        // Never upload a local target directory; the remote has its own.
-        cmd.arg("--exclude").arg("target");
-
-        if !self.transfer_hidden {
-            cmd.arg("--exclude").arg(".*");
-        }
-        if self.no_transfer_git {
-            // `.git` is hidden, so this only matters together with --transfer-hidden.
-            cmd.arg("--exclude").arg(".git");
-        }
-        for pattern in &self.upload_excludes {
-            cmd.arg("--exclude").arg(pattern);
-        }
+        cmd.args(self.upload_filter_args()?);
 
         // rsync runs the destination path through the remote shell, so the
         // directory has to exist before the transfer starts.
@@ -223,10 +213,11 @@ impl Session<'_> {
         // directory, which is where cargo puts them.
         let mut cmd = self.rsync_command();
         cmd.arg("--delete");
-        cmd.arg("--exclude").arg("deps/");
-        cmd.arg("--exclude").arg("build/");
-        cmd.arg("--exclude").arg(".fingerprint/");
-        cmd.arg("--exclude").arg("incremental/");
+        // The same user patterns as the upload. Copy-back is rooted at `target/`
+        // (or at the selected subdirectory), so an unanchored `coil_cache/` also
+        // covers `target/coil_cache`, while a sibling of `cli_db/` is outside a
+        // `--copy-back=cli_db/` transfer entirely.
+        cmd.args(self.copy_back_filter_args()?);
 
         // An empty `relative` means "the whole target directory". Anything else
         // is either a directory (copy its contents) or a single artifact (copy
@@ -370,9 +361,15 @@ impl Session<'_> {
 
         let mut script = String::new();
 
+        if self.remote.shell_env {
+            script.push_str(user_shell_env_script());
+        }
+
         // Issue #26: `source` is not POSIX, so on a dash/sh build host it fails
         // and the rest of the line runs without the environment set up. `.` is
         // portable, and the file is only sourced when it actually exists.
+        // These files run after the login-shell PATH import, so `-e` adds or
+        // replaces scripts without discarding `nvcc` from the user's profile.
         for script_path in &self.remote.env {
             script.push_str(&format!(
                 "[ -f {path} ] && . {path}; ",
@@ -407,10 +404,17 @@ impl Session<'_> {
 
         // Move the stage into the lane. This is the only mutation of a shared
         // tree, and it runs under the lease above.
+        //
+        // User excludes are repeated here, not only on the upload. The stage was
+        // built without those paths, so a mirror `--delete` that did not exclude
+        // them would remove the copies that already live on the lane (a remote
+        // `coil_cache/`, for example). `--delete` still removes everything else
+        // that the stage does not have.
+        let mirror =
+            lane_mirror_rsync(&self.stage_root, root, &self.upload_excludes, self.verbose)?;
         script.push_str(&format!(
-            "if ! rsync -a --delete --exclude target {stage}/ {root}/; then echo {msg} >&2; exit 4; fi; rm -rf {stage}; ",
+            "if ! {mirror}; then echo {msg} >&2; exit 4; fi; rm -rf {stage}; ",
             stage = shell_quote(&self.stage_root),
-            root = shell_quote(root),
             msg = shell_quote(&format!(
                 "remote-3000: failed to move the staged sources into {root}"
             )),
@@ -544,14 +548,61 @@ impl Session<'_> {
         )
     }
 
+    /// rsync filter arguments for the upload into the per-run stage.
+    fn upload_filter_args(&self) -> Result<Vec<String>> {
+        let mut args = vec!["--exclude".to_string(), "target".to_string()];
+        if !self.transfer_hidden {
+            args.push("--exclude".to_string());
+            args.push(".*".to_string());
+        }
+        if self.no_transfer_git {
+            // `.git` is hidden, so this only matters together with --transfer-hidden.
+            args.push("--exclude".to_string());
+            args.push(".git".to_string());
+        }
+        args.extend(self.user_exclude_args()?);
+        Ok(args)
+    }
+
+    /// rsync filter arguments for copy-back.
+    ///
+    /// Built-in skips drop cargo's intermediates. User patterns are appended so
+    /// an excluded cache inside `target/` is neither downloaded nor deleted.
+    fn copy_back_filter_args(&self) -> Result<Vec<String>> {
+        let mut args = Vec::new();
+        for pattern in ["deps/", "build/", ".fingerprint/", "incremental/"] {
+            args.push("--exclude".to_string());
+            args.push(pattern.to_string());
+        }
+        args.extend(self.user_exclude_args()?);
+        Ok(args)
+    }
+
+    /// `--exclude PATTERN` pairs for the configured and CLI patterns.
+    fn user_exclude_args(&self) -> Result<Vec<String>> {
+        let mut args = Vec::with_capacity(self.upload_excludes.len() * 2);
+        for pattern in &self.upload_excludes {
+            validate_exclude_pattern(pattern)?;
+            args.push("--exclude".to_string());
+            args.push(pattern.clone());
+        }
+        Ok(args)
+    }
+
     /// Base rsync invocation with flags shared by every transfer.
     fn rsync_command(&self) -> Command {
         let mut cmd = Command::new("rsync");
-        // `-a` preserves permissions and times, `-P` keeps partial transfers
-        // resumable and shows per-file progress. `-P` is deliberately used
-        // instead of `--info=progress2`, which only exists in rsync >= 3.1 and
-        // made the BSD rsync shipped with macOS fail outright (issue #2).
-        cmd.arg("-aP").arg("--compress").arg("--safe-links");
+        // `-a` preserves permissions and times. `--partial` keeps an interrupted
+        // transfer resumable without `--progress`, which prints one line per
+        // file. Progress is opt-in via `-v`. `--info=progress2` is not used: the
+        // rsync shipped with macOS does not have it (issue #2).
+        cmd.arg("-a")
+            .arg("--partial")
+            .arg("--compress")
+            .arg("--safe-links");
+        if self.verbose {
+            cmd.arg("--progress");
+        }
         cmd.arg("-e").arg(self.remote.rsync_ssh_command());
         cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::inherit());
@@ -578,6 +629,56 @@ impl Session<'_> {
         }
         Ok(())
     }
+}
+
+/// The `rsync --delete` that copies the stage onto the persistent lane tree.
+///
+/// `target` is always excluded, which is what keeps the remote build directory.
+/// Each user pattern is a single shell word (`--exclude='...'`) so a pattern
+/// cannot be parsed as another rsync flag or as shell syntax. The trailing
+/// slashes are outside the quotes on purpose: `'path with spaces'/` is one
+/// shell word whose value ends in `/`.
+fn lane_mirror_rsync(
+    stage: &str,
+    root: &str,
+    excludes: &[String],
+    verbose: bool,
+) -> Result<String> {
+    let mut cmd = String::from("rsync -a --partial");
+    if verbose {
+        cmd.push_str(" --progress");
+    }
+    cmd.push_str(" --delete --exclude=");
+    cmd.push_str(&shell_quote_literal("target"));
+    for pattern in excludes {
+        validate_exclude_pattern(pattern)?;
+        cmd.push_str(" --exclude=");
+        cmd.push_str(&shell_quote_literal(pattern));
+    }
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(stage));
+    cmd.push_str("/ ");
+    cmd.push_str(&shell_quote(root));
+    cmd.push('/');
+    Ok(cmd)
+}
+
+/// Import `PATH` from the remote user's own login shell, then return to this script.
+///
+/// `ssh host command` starts a non-interactive, non-login shell, so it does not
+/// read `.profile` or the interactive rc where a user normally adds `nvcc`.
+/// Asking `$SHELL -ilc` to print `PATH` runs that startup in the user's shell
+/// (bash, zsh, or dash), not by sourcing an rc file with `sh`. fish and csh are
+/// skipped: they cannot execute the rest of this POSIX script.
+///
+/// Startup chatter goes to `/dev/null`. The probe's stderr is shown only when
+/// the probe fails, so a missing shell is visible and the usual "no job control"
+/// warning is not. `~/.cargo/env` and any `-e` files are sourced afterwards by
+/// the caller, which is what puts `cargo` on `PATH` when the profile does not.
+fn user_shell_env_script() -> &'static str {
+    // One line on purpose: the end-to-end harness records each ssh argument as
+    // a single log line, and a newline would hide the rest of the script.
+    r#"_cargo_remote_path=; case "${SHELL:-}" in *fish*|*csh|*tcsh) ;; *) if [ -n "${SHELL:-}" ] && [ -x "${SHELL:-}" ]; then _cargo_remote_err=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/cargo-remote-3000-shell-env.$$"); _cargo_remote_path=$("$SHELL" -ilc 'exec 1>&3; printf %s "$PATH"' 3>&1 >/dev/null 2>"$_cargo_remote_err") || { cat "$_cargo_remote_err" >&2; _cargo_remote_path=; }; rm -f "$_cargo_remote_err"; fi ;; esac; if [ -n "$_cargo_remote_path" ]; then PATH=$_cargo_remote_path; export PATH; fi; unset _cargo_remote_path _cargo_remote_err; "#
 }
 
 /// Reject anything that is not a plain `KEY=value` assignment.
@@ -871,7 +972,9 @@ mod tests {
         let s = session(dir.path());
         let script = s.build_script(&[], "check", &[]).unwrap();
         let lease = script.find("flock -n 9").unwrap();
-        let mirror = script.find("rsync -a --delete --exclude target").unwrap();
+        let mirror = script
+            .find("rsync -a --partial --delete --exclude='target'")
+            .unwrap();
         assert!(lease < mirror, "lease must precede the mirror: {script}");
     }
 
@@ -883,10 +986,40 @@ mod tests {
         let s = session(dir.path());
         let script = s.build_script(&[], "check", &[]).unwrap();
         let mirror = script
-            .split("rsync -a --delete")
+            .split("rsync -a --partial --delete")
             .nth(1)
             .expect("a mirror step");
-        assert!(mirror.starts_with(" --exclude target "), "{script}");
+        assert!(mirror.starts_with(" --exclude='target' "), "{script}");
+    }
+
+    #[test]
+    fn user_excludes_are_quoted_in_the_lane_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        s.upload_excludes = vec![
+            "coil_cache/".to_string(),
+            "my cache/".to_string(),
+            "it's/".to_string(),
+            "$(touch pwned)".to_string(),
+        ];
+        let script = s.build_script(&[], "check", &[]).unwrap();
+        assert!(script.contains("--exclude='coil_cache/'"), "{script}");
+        assert!(script.contains("--exclude='my cache/'"), "{script}");
+        assert!(script.contains(r"--exclude='it'\''s/'"), "{script}");
+        assert!(script.contains("--exclude='$(touch pwned)'"), "{script}");
+        // The payload stays inside the single-quoted pattern. There is no
+        // unquoted `$(` for the remote shell to evaluate.
+        let unquoted = script.replace("--exclude='$(touch pwned)'", "");
+        assert!(!unquoted.contains("$(touch"), "{script}");
+    }
+
+    #[test]
+    fn a_control_character_exclude_never_reaches_the_remote_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        s.upload_excludes = vec!["bad\npattern".to_string()];
+        let err = s.build_script(&[], "check", &[]).unwrap_err().to_string();
+        assert!(err.contains("control character"), "{err}");
     }
 
     #[test]
@@ -951,5 +1084,463 @@ mod tests {
         let b = alloc_script(&remote(), "bbb", "default", 8);
         assert_ne!(a, b);
         assert!(a.contains("H=aaa"), "{a}");
+    }
+
+    fn linux_rsync() -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+        Command::new("rsync")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn read_file(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    fn run_rsync(args: &[String], src: &std::path::Path, dst: &std::path::Path) {
+        let mut cmd = Command::new("rsync");
+        cmd.arg("-a").arg("--delete").args(args);
+        cmd.arg(format!("{}/", src.display()));
+        cmd.arg(format!("{}/", dst.display()));
+        let output = cmd.output().expect("rsync should be installed");
+        assert!(
+            output.status.success(),
+            "rsync failed ({:?}): {}",
+            cmd,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_mirror(stage: &std::path::Path, lane: &std::path::Path, excludes: &[String]) {
+        let script = lane_mirror_rsync(
+            stage.to_str().unwrap(),
+            lane.to_str().unwrap(),
+            excludes,
+            false,
+        )
+        .unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(stage)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mirror failed: {script}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn excluded_remote_cache_survives_while_stale_test_data_is_deleted() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let lane = dir.path().join("lane");
+        // Different lengths: rsync -a skips a file whose size and mtime both
+        // match, and these writes can land in the same second.
+        write_file(&stage.join("src/lib.rs"), "new code from the client\n");
+        write_file(&stage.join("testdata/kept.txt"), "still here\n");
+        // A local cache must not be uploaded over the remote one.
+        write_file(&stage.join("coil_cache/LOCAL"), "do not upload\n");
+        write_file(&lane.join("src/lib.rs"), "old\n");
+        write_file(&lane.join("testdata/stale.bin"), "obsolete test data\n");
+        write_file(&lane.join("coil_cache/MARKER"), "remote cache\n");
+        write_file(
+            &lane.join("target/coil_cache/MARKER"),
+            "remote target cache\n",
+        );
+        write_file(&lane.join("target/debug/app"), "warm artifact\n");
+
+        let excludes = vec!["coil_cache/".to_string()];
+        run_mirror(&stage, &lane, &excludes);
+
+        assert_eq!(
+            read_file(&lane.join("src/lib.rs")),
+            "new code from the client\n"
+        );
+        assert_eq!(read_file(&lane.join("testdata/kept.txt")), "still here\n");
+        assert!(
+            !lane.join("testdata/stale.bin").exists(),
+            "non-excluded test data should be deleted"
+        );
+        assert_eq!(
+            read_file(&lane.join("coil_cache/MARKER")),
+            "remote cache\n",
+            "root coil_cache must survive and must not be replaced"
+        );
+        assert!(!lane.join("coil_cache/LOCAL").exists());
+        assert_eq!(
+            read_file(&lane.join("target/coil_cache/MARKER")),
+            "remote target cache\n"
+        );
+        assert_eq!(read_file(&lane.join("target/debug/app")), "warm artifact\n");
+        assert!(!dir.path().join("pwned").exists());
+    }
+
+    #[test]
+    fn without_an_exclude_delete_still_removes_a_root_cache() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let lane = dir.path().join("lane");
+        write_file(&stage.join("src/lib.rs"), "new code from the client\n");
+        write_file(&lane.join("src/lib.rs"), "old\n");
+        write_file(&lane.join("coil_cache/MARKER"), "remote cache\n");
+        write_file(&lane.join("testdata/stale.bin"), "obsolete\n");
+        write_file(&lane.join("target/coil_cache/MARKER"), "inside target\n");
+
+        run_mirror(&stage, &lane, &[]);
+
+        assert_eq!(
+            read_file(&lane.join("src/lib.rs")),
+            "new code from the client\n"
+        );
+        assert!(!lane.join("coil_cache").exists());
+        assert!(!lane.join("testdata/stale.bin").exists());
+        assert_eq!(
+            read_file(&lane.join("target/coil_cache/MARKER")),
+            "inside target\n",
+            "the built-in target exclude still preserves target/coil_cache"
+        );
+    }
+
+    #[test]
+    fn exclude_patterns_are_data_for_rsync_not_shell_commands() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let lane = dir.path().join("lane");
+        write_file(&stage.join("src/lib.rs"), "new code from the client\n");
+        write_file(&lane.join("obsolete.dat"), "gone\n");
+        write_file(&lane.join("my cache/MARKER"), "spaces\n");
+        write_file(&lane.join("name'quote/MARKER"), "quote\n");
+        write_file(&lane.join("anchored/MARKER"), "root anchor\n");
+        write_file(&lane.join("nested/anchored/MARKER"), "not at root\n");
+        write_file(&lane.join("notes.keep"), "wildcard\n");
+        write_file(&lane.join("notes.tmp"), "not excluded\n");
+        write_file(&lane.join("coil_cache/MARKER"), "cache\n");
+
+        let excludes = vec![
+            "coil_cache/".to_string(),
+            "my cache/".to_string(),
+            "name'quote/".to_string(),
+            "/anchored/".to_string(),
+            "*.keep".to_string(),
+            "coil_cache/; touch pwned".to_string(),
+            "$(touch pwned)".to_string(),
+            "--delete".to_string(),
+        ];
+        run_mirror(&stage, &lane, &excludes);
+
+        assert_eq!(
+            read_file(&lane.join("src/lib.rs")),
+            "new code from the client\n"
+        );
+        assert!(!lane.join("obsolete.dat").exists());
+        assert!(!lane.join("notes.tmp").exists());
+        assert!(!lane.join("nested/anchored/MARKER").exists());
+        assert_eq!(read_file(&lane.join("my cache/MARKER")), "spaces\n");
+        assert_eq!(read_file(&lane.join("name'quote/MARKER")), "quote\n");
+        assert_eq!(read_file(&lane.join("anchored/MARKER")), "root anchor\n");
+        assert_eq!(read_file(&lane.join("notes.keep")), "wildcard\n");
+        assert_eq!(read_file(&lane.join("coil_cache/MARKER")), "cache\n");
+        assert!(!dir.path().join("pwned").exists());
+        assert!(!lane.join("pwned").exists());
+        assert!(!stage.join("pwned").exists());
+    }
+
+    #[test]
+    fn an_excluded_cache_is_not_uploaded_and_other_deletions_still_happen() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let stage = dir.path().join("stage");
+        write_file(&project.join("src/lib.rs"), "source\n");
+        write_file(&project.join("coil_cache/HUGE"), "do not upload\n");
+        write_file(&project.join("target/debug/local"), "local target\n");
+        write_file(
+            &project.join("target/coil_cache/LOCAL"),
+            "local target cache\n",
+        );
+        write_file(&stage.join("stale_test.dat"), "left by an earlier sync\n");
+        write_file(&stage.join("coil_cache/ALREADY"), "stage leftover\n");
+
+        let root = dir.path().join("meta");
+        write_file(&root.join("Cargo.toml"), "");
+        let mut s = session(&root);
+        s.upload_excludes = vec!["coil_cache/".to_string()];
+        let filters = s.upload_filter_args().unwrap();
+        run_rsync(&filters, &project, &stage);
+
+        assert_eq!(read_file(&stage.join("src/lib.rs")), "source\n");
+        assert!(!stage.join("stale_test.dat").exists());
+        assert!(!stage.join("target").exists());
+        assert!(
+            !stage.join("coil_cache/HUGE").exists(),
+            "the project cache must not be uploaded"
+        );
+        // The upload exclude also protects a leftover excluded directory in the
+        // stage, which is what a reused watch-mode stage relies on.
+        assert_eq!(
+            read_file(&stage.join("coil_cache/ALREADY")),
+            "stage leftover\n"
+        );
+        assert!(!filters.iter().any(|arg| arg.contains("delete-excluded")));
+    }
+
+    #[test]
+    fn selective_cli_db_copy_back_does_not_fetch_or_delete_the_cache() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let remote_target = dir.path().join("remote-target");
+        let local_target = dir.path().join("local-target");
+        let project_cache = dir.path().join("coil_cache");
+        write_file(&remote_target.join("cli_db/row"), "from remote\n");
+        write_file(
+            &remote_target.join("coil_cache/FROM-REMOTE"),
+            "must not download\n",
+        );
+        write_file(&local_target.join("cli_db/row"), "old local\n");
+        write_file(&local_target.join("cli_db/extra.dat"), "local only\n");
+        write_file(
+            &local_target.join("coil_cache/PRECIOUS"),
+            "local target cache\n",
+        );
+        write_file(&project_cache.join("PRECIOUS"), "project root cache\n");
+
+        let root = dir.path().join("meta");
+        write_file(&root.join("Cargo.toml"), "");
+        let mut s = session(&root);
+        s.upload_excludes = vec!["coil_cache/".to_string()];
+        let filters = s.copy_back_filter_args().unwrap();
+        run_rsync(
+            &filters,
+            &remote_target.join("cli_db"),
+            &local_target.join("cli_db"),
+        );
+
+        assert_eq!(read_file(&local_target.join("cli_db/row")), "from remote\n");
+        assert!(
+            !local_target.join("cli_db/extra.dat").exists(),
+            "non-excluded files inside the selected path are still deleted"
+        );
+        assert_eq!(
+            read_file(&local_target.join("coil_cache/PRECIOUS")),
+            "local target cache\n"
+        );
+        assert!(!local_target.join("coil_cache/FROM-REMOTE").exists());
+        assert_eq!(
+            read_file(&project_cache.join("PRECIOUS")),
+            "project root cache\n"
+        );
+    }
+
+    #[test]
+    fn whole_target_copy_back_leaves_an_excluded_cache_untouched() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let remote_target = dir.path().join("remote-target");
+        let local_target = dir.path().join("local-target");
+        write_file(&remote_target.join("cli_db/row"), "from remote\n");
+        write_file(
+            &remote_target.join("coil_cache/FROM-REMOTE"),
+            "must not download\n",
+        );
+        write_file(&remote_target.join("deps/crate.rmeta"), "intermediate\n");
+        write_file(&local_target.join("cli_db/row"), "old\n");
+        write_file(&local_target.join("stale.txt"), "delete me\n");
+        write_file(
+            &local_target.join("coil_cache/PRECIOUS"),
+            "keep local bytes\n",
+        );
+        write_file(&local_target.join("deps/old.rmeta"), "local intermediate\n");
+
+        let root = dir.path().join("meta");
+        write_file(&root.join("Cargo.toml"), "");
+        let mut s = session(&root);
+        s.upload_excludes = vec!["coil_cache/".to_string()];
+        let filters = s.copy_back_filter_args().unwrap();
+        run_rsync(&filters, &remote_target, &local_target);
+
+        assert_eq!(read_file(&local_target.join("cli_db/row")), "from remote\n");
+        assert!(!local_target.join("stale.txt").exists());
+        assert_eq!(
+            read_file(&local_target.join("coil_cache/PRECIOUS")),
+            "keep local bytes\n"
+        );
+        assert!(!local_target.join("coil_cache/FROM-REMOTE").exists());
+        // Built-in copy-back excludes still protect cargo intermediates.
+        assert_eq!(
+            read_file(&local_target.join("deps/old.rmeta")),
+            "local intermediate\n"
+        );
+        assert!(!local_target.join("deps/crate.rmeta").exists());
+    }
+
+    #[test]
+    fn quiet_rsync_omits_progress_until_verbose() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        s.verbose = false;
+        let quiet = format!("{:?}", s.rsync_command());
+        assert!(quiet.contains("--partial"), "{quiet}");
+        assert!(!quiet.contains("--progress"), "{quiet}");
+        assert!(!quiet.contains("-P"), "{quiet}");
+        s.verbose = true;
+        let verbose = format!("{:?}", s.rsync_command());
+        assert!(verbose.contains("--progress"), "{verbose}");
+
+        let quiet_mirror =
+            lane_mirror_rsync("/stage", "/lane", &["coil_cache/".into()], false).unwrap();
+        assert!(quiet_mirror.starts_with("rsync -a --partial --delete "));
+        assert!(!quiet_mirror.contains("--progress"), "{quiet_mirror}");
+        let verbose_mirror =
+            lane_mirror_rsync("/stage", "/lane", &["coil_cache/".into()], true).unwrap();
+        assert!(
+            verbose_mirror.contains("rsync -a --partial --progress --delete "),
+            "{verbose_mirror}"
+        );
+    }
+
+    #[test]
+    fn shell_env_can_be_turned_off_without_dropping_env_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        let on = s.build_script(&[], "build", &[]).unwrap();
+        assert!(on.contains("\"$SHELL\" -ilc"), "{on}");
+        assert!(
+            on.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env;"),
+            "{on}"
+        );
+        let remote = Box::leak(Box::new(Remote {
+            shell_env: false,
+            ..(*s.remote).clone()
+        }));
+        s.remote = remote;
+        let off = s.build_script(&[], "build", &[]).unwrap();
+        assert!(!off.contains("-ilc"), "{off}");
+        assert!(
+            off.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env;"),
+            "{off}"
+        );
+    }
+
+    #[test]
+    fn user_shell_path_reaches_cargo_and_stays_off_stdout() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(home.join("cuda/bin")).unwrap();
+        std::fs::write(
+            home.join(".cargo/env"),
+            "export PATH=\"$HOME/.cargo/bin:$PATH\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".bashrc"),
+            "case $- in\n  *i*) ;;\n  *) return ;;\nesac\nexport PATH=\"$HOME/cuda/bin:$PATH\"\necho bashrc-stdout\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".profile"),
+            "echo profile-stdout\nif [ -n \"$BASH_VERSION\" ]; then [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"; fi\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("cuda/bin/nvcc"), "#!/bin/sh\necho nvcc\n").unwrap();
+        std::fs::write(
+            home.join(".cargo/bin/cargo"),
+            "#!/bin/sh\nprintf 'NVCC=%s\\n' \"$(command -v nvcc || echo NO_NVCC)\"\nexit \"${CARGO_EXIT:-0}\"\n",
+        )
+        .unwrap();
+        for name in ["cuda/bin/nvcc", ".cargo/bin/cargo"] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let with_shell = format!(
+            "{}[ -f ~/.cargo/env ] && . ~/.cargo/env; cargo",
+            user_shell_env_script()
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&with_shell)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .output()
+            .expect("bash");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(&format!("NVCC={}/cuda/bin/nvcc", home.display())),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+        assert!(!stdout.contains("bashrc-stdout"), "{stdout}");
+        assert!(!stdout.contains("profile-stdout"), "{stdout}");
+        assert!(!stdout.contains("sudo"), "{stdout}");
+        assert!(!stderr.contains("no job control"), "{stderr}");
+
+        let without = "[ -f ~/.cargo/env ] && . ~/.cargo/env; cargo";
+        let bare = Command::new("bash")
+            .arg("-c")
+            .arg(without)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .output()
+            .unwrap();
+        let bare_out = String::from_utf8_lossy(&bare.stdout);
+        assert!(bare_out.contains("NVCC=NO_NVCC"), "{bare_out}");
+
+        let failing = Command::new("bash")
+            .arg("-c")
+            .arg(&with_shell)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "xterm")
+            .env("CARGO_EXIT", "9")
+            .output()
+            .unwrap();
+        assert_eq!(failing.status.code(), Some(9));
     }
 }

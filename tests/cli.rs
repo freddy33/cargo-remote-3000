@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -170,12 +172,264 @@ fn ssh_cd_dir(invocation: &str) -> String {
         .to_string()
 }
 
+/// Same algorithm as `lane::project_hash`. An end-to-end test cannot call it.
+fn project_hash(project_root: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    project_root.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn install_fake_transport(bin: &Path) -> PathBuf {
+    let log = bin.join("commands.log");
+    for name in ["rsync", "ssh"] {
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s' "{name}" >> "{log}"
+for arg in "$@"; do
+    printf ' %s' "$arg" >> "{log}"
+done
+printf '\n' >> "{log}"
+exit 0
+"#,
+            log = log.display(),
+        );
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        make_executable(&path);
+    }
+    log
+}
+
 fn assert_success(output: &std::process::Output) {
     assert!(
         output.status.success(),
         "command failed: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn print_build_root_matches_the_build_path_and_does_not_contact_the_server() {
+    let transport = tempfile::tempdir().unwrap();
+    let log = install_fake_transport(transport.path());
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("my project");
+    write_crate(&project);
+    // Config names a different lane. `--lane default` must win, and the spaced
+    // temp dir plus the tilde must be printed unchanged.
+    std::fs::write(
+        project.join(".cargo-remote.toml"),
+        "[[remote]]\nhost = \"me@build\"\ntemp_dir = \"~/remote builds\"\nlane = \"other\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args(["remote-3000", "--lane", "default", "--print-build-root"])
+        .current_dir(&project)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", transport.path())
+        .env("HOME", transport.path())
+        .env("APPDATA", transport.path())
+        .env_remove("CARGO_REMOTE_3000_LANE")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(!log.exists(), "print-build-root must not run ssh or rsync");
+
+    // Cargo metadata canonicalizes the project root. Hash that path, not the
+    // pre-canonical directory, or a symlink in the temp path would disagree
+    // with the build.
+    let canonical = project.canonicalize().unwrap();
+    let expected = format!(
+        "~/remote builds/lanes/default/{}\n",
+        project_hash(&canonical)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout, expected);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn print_build_root_uses_the_config_lane_when_the_flag_is_absent() {
+    let transport = tempfile::tempdir().unwrap();
+    let log = install_fake_transport(transport.path());
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+    std::fs::write(
+        project.path().join(".cargo-remote.toml"),
+        "[[remote]]\nhost = \"me@build\"\ntemp_dir = \"~/remote-builds\"\nlane = \"default\"\n",
+    )
+    .unwrap();
+
+    let from_config = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args(["remote-3000", "--print-build-root"])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", transport.path())
+        .env("HOME", transport.path())
+        .env("APPDATA", transport.path())
+        .env_remove("CARGO_REMOTE_3000_LANE")
+        .output()
+        .unwrap();
+    assert_success(&from_config);
+
+    let from_flag = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args(["remote-3000", "--lane", "default", "--print-build-root"])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", transport.path())
+        .env("HOME", transport.path())
+        .env("APPDATA", transport.path())
+        .env_remove("CARGO_REMOTE_3000_LANE")
+        .output()
+        .unwrap();
+    assert_success(&from_flag);
+    assert_eq!(from_config.stdout, from_flag.stdout);
+    let stdout = String::from_utf8(from_config.stdout).unwrap();
+    let canonical = project.path().canonicalize().unwrap();
+    assert_eq!(
+        stdout,
+        format!(
+            "~/remote-builds/lanes/default/{}\n",
+            project_hash(&canonical)
+        )
+    );
+    assert!(!log.exists());
+}
+
+#[test]
+fn print_build_root_explains_when_the_lane_is_not_explicit() {
+    let transport = tempfile::tempdir().unwrap();
+    let log = install_fake_transport(transport.path());
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+    std::fs::write(
+        project.path().join(".cargo-remote.toml"),
+        "[[remote]]\nhost = \"me@build\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args(["remote-3000", "--print-build-root"])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", transport.path())
+        .env("HOME", transport.path())
+        .env("APPDATA", transport.path())
+        .env_remove("CARGO_REMOTE_3000_LANE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("default-2"), "{stderr}");
+    assert!(stderr.contains("does not contact the server"), "{stderr}");
+    assert!(!log.exists());
+}
+
+#[test]
+fn print_build_root_rejects_an_invalid_lane_before_any_transfer() {
+    let transport = tempfile::tempdir().unwrap();
+    let log = install_fake_transport(transport.path());
+    let project = tempfile::tempdir().unwrap();
+    write_crate(project.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-remote-3000"))
+        .args([
+            "remote-3000",
+            "-H",
+            "me@build",
+            "--lane",
+            "bad lane",
+            "--print-build-root",
+        ])
+        .current_dir(project.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("XDG_CONFIG_HOME", transport.path())
+        .env("HOME", transport.path())
+        .env("APPDATA", transport.path())
+        .env_remove("CARGO_REMOTE_3000_LANE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!log.exists(), "an invalid lane must not start ssh or rsync");
+}
+
+#[test]
+fn transfers_are_quiet_unless_verbose_is_requested() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "-c", "build"]));
+    for line in harness
+        .commands()
+        .iter()
+        .filter(|line| line.starts_with("rsync "))
+    {
+        assert!(line.contains("--partial"), "{line}");
+        assert!(!line.contains("--progress"), "{line}");
+        assert!(!line.contains("-P"), "{line}");
+    }
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("rsync -a --partial --delete"), "{ssh}");
+    assert!(!ssh.contains("--progress"), "{ssh}");
+    assert!(ssh.contains("\"$SHELL\" -ilc"), "{ssh}");
+
+    let verbose = Harness::new();
+    assert_success(&verbose.run(&["-H", "user@build-host", "-v", "-c", "build"]));
+    assert!(verbose.rsync_command(0).contains("--progress"));
+    assert!(verbose.rsync_command(1).contains("--progress"));
+    assert!(verbose.ssh_command().contains("--progress"));
+}
+
+#[test]
+fn no_shell_env_skips_the_login_path_probe() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["-H", "user@build-host", "--no-shell-env", "build"]));
+    let ssh = harness.ssh_command();
+    assert!(!ssh.contains("-ilc"), "{ssh}");
+    assert!(
+        ssh.contains("[ -f ~/.cargo/env ] && . ~/.cargo/env"),
+        "{ssh}"
     );
 }
 
@@ -255,6 +509,89 @@ fn sources_are_uploaded_with_the_expected_excludes() {
     assert!(rsync.contains("--exclude .*"), "{rsync}");
     // Issue #4: user supplied exclude patterns are forwarded.
     assert!(rsync.contains("--exclude assets/"), "{rsync}");
+}
+
+#[test]
+fn exclude_patterns_protect_the_lane_mirror_and_copy_back() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&[
+        "-H",
+        "user@build-host",
+        "-x",
+        "coil_cache/",
+        "-x",
+        "my cache/",
+        "-c",
+        "build",
+    ]));
+
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude coil_cache/"), "{upload}");
+    assert!(upload.contains("--exclude my cache/"), "{upload}");
+
+    let copy_back = harness.rsync_command(1);
+    assert!(copy_back.contains("--exclude coil_cache/"), "{copy_back}");
+    assert!(copy_back.contains("--exclude my cache/"), "{copy_back}");
+    assert!(copy_back.contains("--exclude deps/"), "{copy_back}");
+
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='coil_cache/'"), "{ssh}");
+    assert!(ssh.contains("--exclude='my cache/'"), "{ssh}");
+    assert!(
+        ssh.contains("--exclude='target'"),
+        "the built-in target exclude must stay on the mirror: {ssh}"
+    );
+}
+
+#[test]
+fn config_exclude_is_used_when_the_cli_does_not_replace_it() {
+    let harness = Harness::new();
+    std::fs::write(
+        harness.project_dir().join(".cargo-remote.toml"),
+        "[[remote]]\nhost = \"me@legacy\"\nexclude = [\"coil_cache/\"]\n",
+    )
+    .unwrap();
+
+    assert_success(&harness.run(&["build"]));
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude coil_cache/"), "{upload}");
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='coil_cache/'"), "{ssh}");
+    assert!(ssh.contains("me@legacy"), "{ssh}");
+}
+
+#[test]
+fn a_cli_exclude_replaces_the_config_list_everywhere() {
+    let harness = Harness::new();
+    std::fs::write(
+        harness.project_dir().join(".cargo-remote-3000.toml"),
+        "[[remote]]\nhost = \"me@host\"\nexclude = [\"from-config/\"]\n",
+    )
+    .unwrap();
+
+    assert_success(&harness.run(&["-x", "from-cli/", "build"]));
+    let upload = harness.rsync_command(0);
+    assert!(upload.contains("--exclude from-cli/"), "{upload}");
+    assert!(
+        !upload.contains("from-config"),
+        "CLI -x replaces the config list: {upload}"
+    );
+    let ssh = harness.ssh_command();
+    assert!(ssh.contains("--exclude='from-cli/'"), "{ssh}");
+    assert!(!ssh.contains("from-config"), "{ssh}");
+}
+
+#[test]
+fn a_control_character_exclude_is_rejected_before_any_transfer() {
+    let harness = Harness::new();
+    let output = harness.run(&["-H", "user@build-host", "-x", "bad\npattern", "build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("control character"), "{stderr}");
+    assert!(
+        harness.commands().is_empty(),
+        "a rejected pattern must not start rsync or ssh"
+    );
 }
 
 #[test]
