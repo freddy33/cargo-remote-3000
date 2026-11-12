@@ -631,6 +631,55 @@ fn copy_back_skips_the_intermediate_directories() {
 }
 
 #[test]
+fn repeated_copy_back_normalizes_a_parent_path() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&[
+        "-H",
+        "user@build-host",
+        "--copy-back=cli_db/",
+        "--copy-back=../simulations",
+        "build",
+    ]));
+
+    let rsyncs: Vec<String> = harness
+        .commands()
+        .into_iter()
+        .filter(|line| line.starts_with("rsync "))
+        .collect();
+    // Upload, each copy-back, then Cargo.lock.
+    assert_eq!(rsyncs.len(), 4, "{rsyncs:#?}");
+
+    let cli_db = rsyncs
+        .iter()
+        .find(|line| line.contains("cli_db"))
+        .expect("cli_db copy-back");
+    assert!(cli_db.contains("--delete"), "{cli_db}");
+    assert!(cli_db.contains("/target/cli_db"), "{cli_db}");
+
+    let simulations = rsyncs
+        .iter()
+        .find(|line| line.contains("simulations"))
+        .expect("simulations copy-back");
+    assert!(simulations.contains("--delete"), "{simulations}");
+    assert!(
+        !simulations.contains(".."),
+        "rsync must see the resolved directory, not a `..` component: {simulations}"
+    );
+    for word in simulations.split_whitespace() {
+        if word.contains("simulations") {
+            assert!(
+                !word.contains("/target"),
+                "simulations is a sibling of target/, not inside it: {word}"
+            );
+            assert!(
+                word.ends_with("/simulations") || word.ends_with("/simulations/"),
+                "{word}"
+            );
+        }
+    }
+}
+
+#[test]
 fn copy_back_can_select_a_single_artifact() {
     let harness = Harness::new();
     assert_success(&harness.run(&[

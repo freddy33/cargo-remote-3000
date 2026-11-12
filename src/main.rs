@@ -250,8 +250,7 @@ fn make_session<'a>(
 
 /// Copy artifacts and the lock file home.
 fn copy_back(args: &RemoteArgs, session: &Session) -> Result<()> {
-    if let Some(relative) = &args.copy_back {
-        let relative = relative.as_deref().unwrap_or("");
+    for relative in &args.copy_back {
         info!(
             "Copying target/{relative} back to {}",
             session.local_target_dir.display()
@@ -271,7 +270,7 @@ fn copy_back(args: &RemoteArgs, session: &Session) -> Result<()> {
 
 /// Watch mode: one build, then a rebuild on every source change.
 fn run_watch(args: &RemoteArgs, session: &Session) -> Outcome {
-    if args.copy_back.is_some() {
+    if !args.copy_back.is_empty() {
         return Err(Failure::new(
             exit::USAGE,
             anyhow::anyhow!(

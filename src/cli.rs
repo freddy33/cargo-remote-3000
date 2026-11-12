@@ -44,6 +44,7 @@ pub enum Command {
             cargo remote-3000 -r workstation build --message-format human\n  \
             cargo remote-3000 -H user@build-host -p 2222 check\n  \
             cargo remote-3000 -c=release/my-app build --release\n  \
+            cargo remote-3000 --copy-back=cli_db/ --copy-back=../simulations build\n  \
             cargo remote-3000 -w .. build   # path dependencies outside the workspace\n  \
             cargo remote-3000 --watch build\n\n\
             Anything after the cargo command is passed to the remote cargo, so a\n\
@@ -162,20 +163,23 @@ pub struct Remote {
     )]
     pub build_env: Vec<String>,
 
-    /// Copy the remote target directory back, or just one path within it.
+    /// Copy the remote target directory back, or paths within it. Repeatable.
     ///
-    /// `-c` copies everything. To copy a single artifact the value has to be
-    /// attached with `=`, as in `-c=release/my-binary`, so that a following
-    /// cargo command name is never mistaken for the value.
+    /// `-c` copies everything. Each value is attached with `=`, as in
+    /// `-c=release/my-binary` or `--copy-back=cli_db/`, so a following cargo
+    /// command name is never mistaken for the path. A path is relative to the
+    /// remote `target/` directory; `../simulations` copies the lane's
+    /// `simulations/` directory and must stay inside the build lane.
     #[arg(
         short,
         long,
         value_name = "PATH",
+        action = ArgAction::Append,
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = ""
     )]
-    pub copy_back: Option<Option<String>>,
+    pub copy_back: Vec<String>,
 
     /// Do not copy Cargo.lock back to the local machine
     #[arg(long, action = ArgAction::SetTrue)]
@@ -326,7 +330,7 @@ mod tests {
         ]);
         assert_eq!(remote.remote.host.as_deref(), Some("user@host"));
         assert_eq!(remote.remote.ssh_port, Some(2222));
-        assert_eq!(remote.copy_back, Some(Some(String::new())));
+        assert_eq!(remote.copy_back, vec![String::new()]);
         assert!(remote.no_transfer_git);
         assert_eq!(remote.command.as_deref(), Some("build"));
         assert_eq!(remote.args, ["--release"]);
@@ -353,10 +357,29 @@ mod tests {
     #[test]
     fn copy_back_accepts_an_optional_path() {
         let without = parse(&["cargo", "remote-3000", "-c", "build"]);
-        assert_eq!(without.copy_back, Some(Some(String::new())));
+        assert_eq!(without.copy_back, vec![String::new()]);
 
         let with = parse(&["cargo", "remote-3000", "-c=release/app", "build"]);
-        assert_eq!(with.copy_back, Some(Some("release/app".to_string())));
+        assert_eq!(with.copy_back, vec!["release/app".to_string()]);
+
+        // A bare long flag is the whole target directory, same as `-c`.
+        let bare = parse(&["cargo", "remote-3000", "--copy-back", "build"]);
+        assert_eq!(bare.copy_back, vec![String::new()]);
+    }
+
+    #[test]
+    fn copy_back_repeats() {
+        let remote = parse(&[
+            "cargo",
+            "remote-3000",
+            "--copy-back=cli_db/",
+            "--copy-back=../simulations",
+            "build",
+        ]);
+        assert_eq!(
+            remote.copy_back,
+            vec!["cli_db/".to_string(), "../simulations".to_string()]
+        );
     }
 
     #[test]

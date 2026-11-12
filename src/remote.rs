@@ -201,11 +201,31 @@ impl Session<'_> {
     }
 
     /// Copy `relative` out of the remote target directory back to the local one.
+    ///
+    /// `relative` is resolved against `target/` on both sides. `../simulations`
+    /// therefore means the lane-root `simulations/` directory remotely and
+    /// `<project>/simulations` locally, and those resolved paths are what rsync
+    /// sees. rsync 3.2.7 follows `..` in the destination: `--delete` on
+    /// `target/../../outside/` removes files in `outside/`. A path that
+    /// resolves outside the build lane, or outside the local project, is
+    /// refused before any transfer.
     pub fn download_target(&self, relative: &str) -> Result<()> {
         let remote_target = self
             .remote_target_dir
             .clone()
-            .unwrap_or_else(|| format!("{}/target", self.remote_crate_dir));
+            .unwrap_or_else(|| format!("{}/target", self.remote_crate_dir.trim_end_matches('/')));
+        let relative = relative.trim_matches('/');
+        let remote_path = resolve_remote_copy_path(&remote_target, &self.build_root, relative)?;
+        let local_path =
+            resolve_local_copy_path(&self.local_target_dir, self.project_root, relative)?;
+
+        // A path that stayed inside `target/` keeps today's transfer, including
+        // a symlinked target directory. A path that climbed out with `..` must
+        // not follow a symlink: `--delete` would then rewrite the link target.
+        let climbed_out = !remote_is_within(&remote_target, &remote_path);
+        if !local_path.starts_with(&self.local_target_dir) {
+            reject_local_symlink_redirect(self.project_root, &local_path)?;
+        }
 
         // `deps/` and `build/` hold intermediates that are either regenerated
         // locally or large enough to dominate transfer time. See PR #24.
@@ -223,32 +243,37 @@ impl Session<'_> {
         // is either a directory (copy its contents) or a single artifact (copy
         // the file itself), and rsync needs to be told which: a trailing slash
         // asserts a directory and fails with ENOTDIR on a binary.
-        let relative = relative.trim_matches('/');
-        let (remote_path, local_path) = if relative.is_empty() {
+        let (remote_arg, local_arg) = if relative.is_empty() {
             (
-                format!("{}:{}/", self.remote.host, remote_target),
+                format!(
+                    "{}:{}/",
+                    self.remote.host,
+                    remote_target.trim_end_matches('/')
+                ),
                 format!("{}/", self.local_target_dir.display()),
             )
-        } else if self.remote_is_dir(&format!("{remote_target}/{relative}"))? {
+        } else if self.remote_is_dir(
+            &remote_path,
+            climbed_out.then_some(self.build_root.as_str()),
+        )? {
             (
-                format!("{}:{}/{}/", self.remote.host, remote_target, relative),
-                format!("{}/{}/", self.local_target_dir.display(), relative),
+                format!("{}:{}/", self.remote.host, remote_path),
+                format!("{}/", local_path.display()),
             )
         } else {
-            let local = self.local_target_dir.join(relative);
             // rsync will not create intermediate directories for a single file.
-            if let Some(parent) = local.parent() {
+            if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("failed to create the local directory {}", parent.display())
                 })?;
             }
             (
-                format!("{}:{}/{}", self.remote.host, remote_target, relative),
-                local.display().to_string(),
+                format!("{}:{}", self.remote.host, remote_path),
+                local_path.display().to_string(),
             )
         };
-        cmd.arg(remote_path);
-        cmd.arg(local_path);
+        cmd.arg(remote_arg);
+        cmd.arg(local_arg);
 
         self.run(&mut cmd, "copy the target directory back")
     }
@@ -259,7 +284,14 @@ impl Session<'_> {
     /// and "copy this file", and guessing wrong fails the transfer: a trailing
     /// slash on a file is `ENOTDIR`, and no trailing slash on an existing
     /// directory nests it inside itself on the next run.
-    fn remote_is_dir(&self, path: &str) -> Result<bool> {
+    ///
+    /// When `lane_root` is set, the probe also refuses a symlink on the way to
+    /// `path`. rsync would follow it and could read a tree outside the lane.
+    fn remote_is_dir(&self, path: &str, lane_root: Option<&str>) -> Result<bool> {
+        let script = match lane_root {
+            Some(root) => confined_remote_dir_script(root, path),
+            None => format!("test -d {}", shell_quote(path)),
+        };
         let mut cmd = Command::new("ssh");
         cmd.args(self.remote.ssh_args());
         if !self
@@ -270,22 +302,31 @@ impl Session<'_> {
         {
             cmd.arg("-o").arg("LogLevel=ERROR");
         }
-        cmd.arg(&self.remote.host)
-            .arg(format!("test -d {}", shell_quote(path)));
+        cmd.arg(&self.remote.host).arg(script);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         if self.verbose {
             debug!("running: {cmd:?}");
         }
-        // `test -d` exits 1 for "not a directory". A failed ssh (255) also lands
-        // here and surfaces as a transfer error below, which is accurate enough:
-        // the artifact could not be located.
-        Ok(cmd
-            .status()
-            .with_context(|| format!("failed to run `ssh` to {}", self.remote.host))?
-            .success())
+        let output = cmd
+            .output()
+            .with_context(|| format!("failed to run `ssh` to {}", self.remote.host))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // The confinement probe's own failure. Exit 1 is `test -d` saying
+            // "not a directory", and a failed ssh (255) still falls through to
+            // the transfer error below: the artifact could not be located.
+            Some(2) => {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if detail.is_empty() {
+                    bail!("copy-back path {path} is not confined to the build lane");
+                }
+                bail!("{detail}");
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Copy the workspace `Cargo.lock` back, if the remote produced one.
@@ -679,6 +720,185 @@ fn user_shell_env_script() -> &'static str {
     // One line on purpose: the end-to-end harness records each ssh argument as
     // a single log line, and a newline would hide the rest of the script.
     r#"_cargo_remote_path=; case "${SHELL:-}" in *fish*|*csh|*tcsh) ;; *) if [ -n "${SHELL:-}" ] && [ -x "${SHELL:-}" ]; then _cargo_remote_err=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/cargo-remote-3000-shell-env.$$"); _cargo_remote_path=$("$SHELL" -ilc 'exec 1>&3; printf %s "$PATH"' 3>&1 >/dev/null 2>"$_cargo_remote_err") || { cat "$_cargo_remote_err" >&2; _cargo_remote_path=; }; rm -f "$_cargo_remote_err"; fi ;; esac; if [ -n "$_cargo_remote_path" ]; then PATH=$_cargo_remote_path; export PATH; fi; unset _cargo_remote_path _cargo_remote_err; "#
+}
+
+/// Resolve `relative` against the remote `target/` directory.
+///
+/// The result never contains a `..` component. A path that stays inside
+/// `target/` is unchanged apart from that cleanup. A path that climbs out, such
+/// as `../simulations`, must land strictly inside the lane root: rsync is given
+/// that directory and nothing above it.
+fn resolve_remote_copy_path(target: &str, lane_root: &str, relative: &str) -> Result<String> {
+    if relative.is_empty() {
+        return Ok(target.trim_end_matches('/').to_string());
+    }
+    validate_copy_back_relative(relative)?;
+    let joined = format!("{}/{}", target.trim_end_matches('/'), relative);
+    let normalized = normalize_remote_path(&joined);
+    if remote_is_within(target, &normalized) || remote_is_strictly_inside(lane_root, &normalized) {
+        return Ok(normalized);
+    }
+    bail!(
+        "copy-back path {relative:?} resolves to {normalized}, which is outside the build lane ({})",
+        lane_root.trim_end_matches('/')
+    );
+}
+
+/// Resolve `relative` against the local target directory.
+///
+/// The same rule as [`resolve_remote_copy_path`], with the project root in
+/// place of the lane. `../simulations` from `<project>/target` is
+/// `<project>/simulations`, which is the only directory `--delete` may touch.
+fn resolve_local_copy_path(target: &Path, project_root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty() {
+        return Ok(target.to_path_buf());
+    }
+    validate_copy_back_relative(relative)?;
+    let normalized = normalize_local_path(&target.join(relative));
+    if normalized.starts_with(target) || local_is_strictly_inside(project_root, &normalized) {
+        return Ok(normalized);
+    }
+    bail!(
+        "copy-back path {relative:?} resolves to {}, which is outside the project ({})",
+        normalized.display(),
+        project_root.display()
+    );
+}
+
+fn validate_copy_back_relative(relative: &str) -> Result<()> {
+    if relative.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        bail!(
+            "copy-back path {relative:?} contains a control character; \
+             it is passed to rsync as a path"
+        );
+    }
+    Ok(())
+}
+
+/// Collapse `.` and `..` in a remote path, which always uses `/`.
+///
+/// A leading `/` stays the root, and a leading `~` is kept as a component so
+/// `~/remote-builds/...` still expands on the build server. `..` that would
+/// climb past either is dropped rather than emitted: the caller then sees a
+/// path that fails the lane-root check.
+fn normalize_remote_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last().copied() {
+                // `~` is the remote home, not a directory this path may climb
+                // past. Drop the extra `..` so the result cannot be
+                // `~/../somewhere`.
+                Some("~") => {}
+                Some("..") => parts.push(".."),
+                Some(_) => {
+                    parts.pop();
+                }
+                None if absolute => {}
+                None => parts.push(".."),
+            },
+            other => parts.push(other),
+        }
+    }
+    if absolute {
+        format!("/{}", parts.join("/"))
+    } else if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn normalize_local_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn remote_is_within(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn remote_is_strictly_inside(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    !root.is_empty() && path.starts_with(&format!("{root}/"))
+}
+
+fn local_is_strictly_inside(root: &Path, path: &Path) -> bool {
+    path.starts_with(root) && path != root
+}
+
+/// Refuse a symlink between the project root and `path`.
+///
+/// `--delete` follows a symlink used as the destination and rewrites whatever
+/// it points at. A real `simulations/` directory is left alone; a link there is
+/// not a directory this transfer may delete through.
+fn reject_local_symlink_redirect(project_root: &Path, path: &Path) -> Result<()> {
+    let rest = path.strip_prefix(project_root).with_context(|| {
+        format!(
+            "copy-back path {} is outside the project {}",
+            path.display(),
+            project_root.display()
+        )
+    })?;
+    let mut current = project_root.to_path_buf();
+    for component in rest.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!(
+                    "copy-back destination {} is a symlink; refusing to follow it, \
+                     because --delete would change the link target instead of {}",
+                    current.display(),
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect copy-back path {}", current.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remote `test -d` that also refuses to walk a symlink out of the lane.
+///
+/// One ssh argument, and one line: the end-to-end harness records each ssh
+/// argument as a single log line. Exit 2 is the confinement failure; exit 1 is
+/// left for `test -d`.
+fn confined_remote_dir_script(root: &str, path: &str) -> String {
+    let root = root.trim_end_matches('/');
+    let rest = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    format!(
+        "cur={root}; rest={rest}; while [ -n \"$rest\" ]; do part=${{rest%%/*}}; case \"$rest\" in */*) rest=${{rest#*/}} ;; *) rest= ;; esac; [ -z \"$part\" ] && continue; if [ \"$part\" = \"..\" ] || [ \"$part\" = \".\" ]; then echo \"remote-3000: copy-back refuses a '$part' path component\" >&2; exit 2; fi; cur=\"$cur/$part\"; if [ -L \"$cur\" ]; then echo \"remote-3000: $cur is a symlink; copy-back will not follow it out of the build lane\" >&2; exit 2; fi; if [ ! -e \"$cur\" ]; then break; fi; done; test -d {path}",
+        root = shell_quote(root),
+        rest = shell_quote(rest),
+        path = shell_quote(path),
+    )
 }
 
 /// Reject anything that is not a plain `KEY=value` assignment.
@@ -1542,5 +1762,241 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(failing.status.code(), Some(9));
+    }
+
+    #[test]
+    fn copy_back_parent_path_maps_into_the_lane_and_rejects_escapes() {
+        let lane = "/tmp/remote-builds/lanes/default/12345";
+        let target = format!("{lane}/target");
+        assert_eq!(
+            resolve_remote_copy_path(&target, lane, "../simulations").unwrap(),
+            format!("{lane}/simulations")
+        );
+        assert_eq!(
+            resolve_remote_copy_path(&target, lane, "cli_db/").unwrap(),
+            format!("{lane}/target/cli_db")
+        );
+        assert_eq!(resolve_remote_copy_path(&target, lane, "").unwrap(), target);
+        // A `..` that cancels an intermediate directory is the same destination.
+        assert_eq!(
+            resolve_remote_copy_path(&target, lane, "foo/../../simulations").unwrap(),
+            format!("{lane}/simulations")
+        );
+
+        for relative in ["..", "../..", "../../etc", "../simulations/../../outside"] {
+            let err = resolve_remote_copy_path(&target, lane, relative)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("outside the build lane"), "{relative}: {err}");
+            assert!(!err.contains("\n"), "{err}");
+        }
+
+        // The default temp dir keeps its tilde so the remote shell can expand it,
+        // and `..` still cannot climb past that lane.
+        let tilde_lane = "~/remote-builds/lanes/default/abc";
+        let tilde_target = format!("{tilde_lane}/target");
+        assert_eq!(
+            resolve_remote_copy_path(&tilde_target, tilde_lane, "../simulations").unwrap(),
+            format!("{tilde_lane}/simulations")
+        );
+        let tilde_escape =
+            resolve_remote_copy_path(&tilde_target, tilde_lane, "../../../../../../etc")
+                .unwrap_err()
+                .to_string();
+        assert!(tilde_escape.contains("resolves to ~/etc"), "{tilde_escape}");
+        assert!(
+            tilde_escape.contains("outside the build lane"),
+            "{tilde_escape}"
+        );
+
+        let project = Path::new("/proj");
+        let local_target = Path::new("/proj/target");
+        assert_eq!(
+            resolve_local_copy_path(local_target, project, "../simulations").unwrap(),
+            PathBuf::from("/proj/simulations")
+        );
+        assert_eq!(
+            resolve_local_copy_path(local_target, project, "release/app").unwrap(),
+            PathBuf::from("/proj/target/release/app")
+        );
+        assert_eq!(
+            resolve_local_copy_path(local_target, project, "").unwrap(),
+            local_target
+        );
+        for relative in ["..", "../..", "../../outside"] {
+            let err = resolve_local_copy_path(local_target, project, relative)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("outside the project"), "{relative}: {err}");
+        }
+        assert!(resolve_remote_copy_path(&target, lane, "bad\nname").is_err());
+    }
+
+    #[test]
+    fn copy_back_of_a_parent_directory_deletes_only_inside_that_directory() {
+        if !linux_rsync() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let lane = dir.path().join("lane");
+        write_file(&project.join("Cargo.toml"), "[package]\nname = \"demo\"\n");
+        write_file(&project.join("src/lib.rs"), "pub fn demo() {}\n");
+        write_file(&project.join("notes.txt"), "project root file\n");
+        write_file(&project.join("other/keep.txt"), "sibling dir\n");
+        write_file(&project.join("target/debug/app"), "local artifact\n");
+        write_file(
+            &project.join("target/cli_db/local-only"),
+            "stay in target\n",
+        );
+        // Different lengths: rsync -a skips a file whose size and mtime both
+        // match, and these writes can land in the same second.
+        write_file(&project.join("simulations/old.txt"), "old sim\n");
+        write_file(&project.join("simulations/stale.txt"), "delete me\n");
+
+        write_file(
+            &lane.join("simulations/old.txt"),
+            "new simulation content\n",
+        );
+        write_file(&lane.join("simulations/extra.txt"), "added from the lane\n");
+        write_file(&lane.join("secret.txt"), "lane root secret\n");
+        write_file(&lane.join("target/secret.txt"), "target secret\n");
+        write_file(&lane.join("elsewhere/x.txt"), "not simulations\n");
+
+        let lane_root = lane.display().to_string();
+        let remote =
+            resolve_remote_copy_path(&format!("{lane_root}/target"), &lane_root, "../simulations")
+                .unwrap();
+        let local =
+            resolve_local_copy_path(&project.join("target"), &project, "../simulations").unwrap();
+        assert_eq!(remote, format!("{lane_root}/simulations"));
+        assert_eq!(local, project.join("simulations"));
+        assert!(!remote.contains(".."), "{remote}");
+        assert!(local
+            .components()
+            .all(|component| component != std::path::Component::ParentDir));
+
+        let meta = dir.path().join("meta");
+        write_file(&meta.join("Cargo.toml"), "");
+        let mut session = session(&meta);
+        session.upload_excludes = vec!["coil_cache/".to_string()];
+        let filters = session.copy_back_filter_args().unwrap();
+        run_rsync(&filters, Path::new(&remote), &local);
+
+        assert_eq!(
+            read_file(&project.join("simulations/old.txt")),
+            "new simulation content\n"
+        );
+        assert_eq!(
+            read_file(&project.join("simulations/extra.txt")),
+            "added from the lane\n"
+        );
+        assert!(
+            !project.join("simulations/stale.txt").exists(),
+            "--delete still removes files inside simulations/"
+        );
+        assert_eq!(read_file(&project.join("notes.txt")), "project root file\n");
+        assert_eq!(read_file(&project.join("other/keep.txt")), "sibling dir\n");
+        assert_eq!(
+            read_file(&project.join("target/debug/app")),
+            "local artifact\n"
+        );
+        assert_eq!(
+            read_file(&project.join("target/cli_db/local-only")),
+            "stay in target\n"
+        );
+        assert!(!project.join("secret.txt").exists());
+        assert_eq!(read_file(&lane.join("secret.txt")), "lane root secret\n");
+        assert_eq!(
+            read_file(&lane.join("target/secret.txt")),
+            "target secret\n"
+        );
+        assert_eq!(
+            read_file(&lane.join("elsewhere/x.txt")),
+            "not simulations\n"
+        );
+    }
+
+    #[test]
+    fn copy_back_refuses_a_symlink_that_would_redirect_delete() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        write_file(&project.join("target/debug/app"), "artifact\n");
+        write_file(&outside.join("secret.txt"), "do not delete\n");
+        std::os::unix::fs::symlink(&outside, project.join("simulations")).unwrap();
+
+        let err = reject_local_symlink_redirect(&project, &project.join("simulations"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(err.contains("simulations"), "{err}");
+        assert_eq!(
+            read_file(&outside.join("secret.txt")),
+            "do not delete\n",
+            "refusing the symlink must not touch the link target"
+        );
+
+        // A real directory at the same place is the path --delete is allowed to use.
+        std::fs::remove_file(project.join("simulations")).unwrap();
+        write_file(&project.join("simulations/old.txt"), "sim\n");
+        reject_local_symlink_redirect(&project, &project.join("simulations")).unwrap();
+    }
+
+    #[test]
+    fn remote_dir_probe_refuses_to_follow_a_symlink_out_of_the_lane() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lane = dir.path().join("lane");
+        let outside = dir.path().join("outside");
+        write_file(&lane.join("simulations/old.txt"), "sim\n");
+        write_file(&outside.join("secret.txt"), "secret\n");
+        let simulations = lane.join("simulations");
+        let script =
+            confined_remote_dir_script(lane.to_str().unwrap(), simulations.to_str().unwrap());
+        assert!(
+            !script.contains('\n'),
+            "the probe is one ssh argument: {script}"
+        );
+
+        let ok = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        assert!(
+            ok.status.success(),
+            "a real directory is accepted: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        std::fs::remove_dir_all(&simulations).unwrap();
+        std::os::unix::fs::symlink(&outside, &simulations).unwrap();
+        let refused = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("symlink"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(read_file(&outside.join("secret.txt")), "secret\n");
+
+        let missing = confined_remote_dir_script(
+            lane.to_str().unwrap(),
+            lane.join("absent").to_str().unwrap(),
+        );
+        let not_dir = Command::new("sh").arg("-c").arg(&missing).output().unwrap();
+        assert_eq!(
+            not_dir.status.code(),
+            Some(1),
+            "a missing path is 'not a directory', not a confinement failure: {}",
+            String::from_utf8_lossy(&not_dir.stderr)
+        );
     }
 }
