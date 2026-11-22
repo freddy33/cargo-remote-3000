@@ -44,6 +44,7 @@ pub enum Command {
             cargo remote-3000 -r workstation build --message-format human\n  \
             cargo remote-3000 -H user@build-host -p 2222 check\n  \
             cargo remote-3000 -c=release/my-app build --release\n  \
+            cargo remote-3000 --copy-back=cli_db/ --copy-back=../simulations build\n  \
             cargo remote-3000 -w .. build   # path dependencies outside the workspace\n  \
             cargo remote-3000 --watch build\n\n\
             Anything after the cargo command is passed to the remote cargo, so a\n\
@@ -80,10 +81,28 @@ pub struct RemoteOpts {
     pub temp_dir: Option<String>,
 
     /// Script sourced before the remote build, e.g. `~/.cargo/env`. Repeatable.
+    ///
+    /// Replaces the config `env` list. These files are sourced after the remote
+    /// user's login shell `PATH` has been imported. They do not replace that
+    /// import; `--no-shell-env` does.
     #[arg(short, long, value_name = "SCRIPT")]
     pub env: Vec<String>,
 
-    /// Exclude pattern passed to rsync when uploading sources. Repeatable.
+    /// Do not import PATH from the remote user's login shell
+    ///
+    /// By default the build asks `$SHELL -ilc` for `PATH` (the same startup an
+    /// interactive login would use) and then sources `env`. This flag keeps only
+    /// the `env` scripts, which default to `~/.cargo/env`.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub no_shell_env: bool,
+
+    /// rsync exclude pattern for the upload, the lane mirror, and copy-back.
+    ///
+    /// Repeatable. A matched path is not transferred, and `--delete` leaves it
+    /// in place on the destination. With no `-x`, the config file's `exclude`
+    /// list is used; passing `-x` replaces that list. `coil_cache/` matches a
+    /// directory of that name anywhere, including a project-root cache and
+    /// `target/coil_cache`.
     #[arg(short = 'x', long, value_name = "PATTERN")]
     pub exclude: Vec<String>,
 
@@ -144,20 +163,23 @@ pub struct Remote {
     )]
     pub build_env: Vec<String>,
 
-    /// Copy the remote target directory back, or just one path within it.
+    /// Copy the remote target directory back, or paths within it. Repeatable.
     ///
-    /// `-c` copies everything. To copy a single artifact the value has to be
-    /// attached with `=`, as in `-c=release/my-binary`, so that a following
-    /// cargo command name is never mistaken for the value.
+    /// `-c` copies everything. Each value is attached with `=`, as in
+    /// `-c=release/my-binary` or `--copy-back=cli_db/`, so a following cargo
+    /// command name is never mistaken for the path. A path is relative to the
+    /// remote `target/` directory; `../simulations` copies the lane's
+    /// `simulations/` directory and must stay inside the build lane.
     #[arg(
         short,
         long,
         value_name = "PATH",
+        action = ArgAction::Append,
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = ""
     )]
-    pub copy_back: Option<Option<String>>,
+    pub copy_back: Vec<String>,
 
     /// Do not copy Cargo.lock back to the local machine
     #[arg(long, action = ArgAction::SetTrue)]
@@ -184,13 +206,25 @@ pub struct Remote {
     #[arg(short = 'W', long, action = ArgAction::SetTrue)]
     pub watch: bool,
 
-    /// Log every rsync/ssh invocation instead of just progress
+    /// Show rsync progress and log every rsync and ssh invocation
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// The cargo subcommand executed on the remote host, e.g. `build` or `test`
-    #[arg(value_name = "COMMAND", required = true)]
-    pub command: String,
+    /// Print the persistent lane directory and exit
+    ///
+    /// Local only: no ssh, rsync, or remote cargo. Uses the same project path,
+    /// `temp_dir`, and lane as a build. An explicit lane is required (`--lane`,
+    /// `$CARGO_REMOTE_3000_LANE`, or `lane` in the config). Without one, a build
+    /// may move from `default` to `default-2` when the server lane is busy, and
+    /// this command cannot know which. A leading `~` in `temp_dir` is left for
+    /// the remote shell.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub print_build_root: bool,
+
+    /// The cargo subcommand executed on the remote host, e.g. `build` or `test`.
+    /// Not used with `--print-build-root`.
+    #[arg(value_name = "COMMAND", required_unless_present = "print_build_root")]
+    pub command: Option<String>,
 
     /// Arguments appended to the remote cargo invocation. Everything after the
     /// cargo command is passed through, so `--` is not required.
@@ -248,7 +282,7 @@ mod tests {
     #[test]
     fn bare_build_works() {
         let remote = parse(&["cargo", "remote-3000", "build"]);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert!(remote.args.is_empty());
     }
 
@@ -263,7 +297,7 @@ mod tests {
             "human",
             "--release",
         ]);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert_eq!(remote.args, ["--message-format", "human", "--release"]);
     }
 
@@ -276,7 +310,7 @@ mod tests {
     #[test]
     fn double_dash_is_not_duplicated_into_args() {
         let remote = parse(&["cargo", "remote-3000", "test", "--", "--release"]);
-        assert_eq!(remote.command, "test");
+        assert_eq!(remote.command.as_deref(), Some("test"));
         assert_eq!(remote.args, ["--release"]);
     }
 
@@ -296,9 +330,9 @@ mod tests {
         ]);
         assert_eq!(remote.remote.host.as_deref(), Some("user@host"));
         assert_eq!(remote.remote.ssh_port, Some(2222));
-        assert_eq!(remote.copy_back, Some(Some(String::new())));
+        assert_eq!(remote.copy_back, vec![String::new()]);
         assert!(remote.no_transfer_git);
-        assert_eq!(remote.command, "build");
+        assert_eq!(remote.command.as_deref(), Some("build"));
         assert_eq!(remote.args, ["--release"]);
     }
 
@@ -323,10 +357,29 @@ mod tests {
     #[test]
     fn copy_back_accepts_an_optional_path() {
         let without = parse(&["cargo", "remote-3000", "-c", "build"]);
-        assert_eq!(without.copy_back, Some(Some(String::new())));
+        assert_eq!(without.copy_back, vec![String::new()]);
 
         let with = parse(&["cargo", "remote-3000", "-c=release/app", "build"]);
-        assert_eq!(with.copy_back, Some(Some("release/app".to_string())));
+        assert_eq!(with.copy_back, vec!["release/app".to_string()]);
+
+        // A bare long flag is the whole target directory, same as `-c`.
+        let bare = parse(&["cargo", "remote-3000", "--copy-back", "build"]);
+        assert_eq!(bare.copy_back, vec![String::new()]);
+    }
+
+    #[test]
+    fn copy_back_repeats() {
+        let remote = parse(&[
+            "cargo",
+            "remote-3000",
+            "--copy-back=cli_db/",
+            "--copy-back=../simulations",
+            "build",
+        ]);
+        assert_eq!(
+            remote.copy_back,
+            vec!["cli_db/".to_string(), "../simulations".to_string()]
+        );
     }
 
     #[test]
@@ -355,6 +408,20 @@ mod tests {
     #[test]
     fn cargo_command_is_required() {
         assert!(Cli::try_parse_from(["cargo", "remote-3000"]).is_err());
+    }
+
+    #[test]
+    fn print_build_root_does_not_need_a_cargo_command() {
+        let remote = parse(&[
+            "cargo",
+            "remote-3000",
+            "--lane",
+            "default",
+            "--print-build-root",
+        ]);
+        assert!(remote.print_build_root);
+        assert_eq!(remote.remote.lane.as_deref(), Some("default"));
+        assert_eq!(remote.command, None);
     }
 
     #[test]

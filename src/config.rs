@@ -53,6 +53,8 @@ pub struct Remote {
     pub ssh_options: Vec<String>,
     pub temp_dir: String,
     pub env: Vec<String>,
+    /// When true, import `PATH` from the remote user's login shell before `env`.
+    pub shell_env: bool,
     pub exclude: Vec<String>,
     /// Independent build lane, or `None` for the shared default lane.
     pub lane: Option<String>,
@@ -84,6 +86,9 @@ struct PartialRemote {
     temp_dir: Option<String>,
     #[serde(default)]
     env: Option<EnvSpec>,
+    /// `false` skips the login-shell PATH import. Omitted means import it.
+    #[serde(default)]
+    shell_env: Option<bool>,
     #[serde(default)]
     exclude: Vec<String>,
     #[serde(default)]
@@ -261,10 +266,21 @@ impl Config {
             } else {
                 opts.env.clone()
             },
-            exclude: if opts.exclude.is_empty() {
-                base.exclude.clone()
+            shell_env: if opts.no_shell_env {
+                false
             } else {
-                opts.exclude.clone()
+                base.shell_env.unwrap_or(true)
+            },
+            exclude: {
+                let exclude = if opts.exclude.is_empty() {
+                    base.exclude.clone()
+                } else {
+                    opts.exclude.clone()
+                };
+                for pattern in &exclude {
+                    validate_exclude_pattern(pattern)?;
+                }
+                exclude
             },
             lane: opts.lane.clone().or_else(|| base.lane.clone()),
             // Resolved here, so every `Remote` in the program carries a
@@ -320,6 +336,7 @@ static EMPTY_REMOTE: PartialRemote = PartialRemote {
     ssh_options: Vec::new(),
     temp_dir: None,
     env: None,
+    shell_env: None,
     exclude: Vec::new(),
     lane: None,
     toolchain: None,
@@ -352,6 +369,7 @@ impl PartialRemote {
         }
         self.temp_dir = other.temp_dir.or(self.temp_dir.take());
         self.env = other.env.or(self.env.take());
+        self.shell_env = other.shell_env.or(self.shell_env.take());
         if !other.exclude.is_empty() {
             self.exclude = other.exclude;
         }
@@ -419,6 +437,33 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Single-quote a string so a POSIX shell cannot expand, split, or execute it.
+///
+/// Unlike [`shell_quote`], a leading `~` is quoted too. rsync exclude patterns
+/// are data, not paths the remote shell should expand.
+pub fn shell_quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Reject exclude patterns that cannot be passed to rsync as a single text rule.
+///
+/// Patterns are interpolated into the remote shell script. Control characters
+/// would break that script even inside quotes, so they are refused before any
+/// transfer starts. Spaces, quotes, globs and anchored paths are allowed and
+/// quoted at the point of use.
+pub fn validate_exclude_pattern(pattern: &str) -> Result<()> {
+    if pattern.is_empty() {
+        bail!("exclude pattern must not be empty");
+    }
+    if pattern.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        bail!(
+            "exclude pattern {pattern:?} contains a control character; \
+             rsync patterns are matched as text"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +527,39 @@ mod tests {
         assert_eq!(remote.temp_dir, "/var/tmp/rust");
         assert_eq!(remote.env, ["~/.cargo/env"]);
         assert_eq!(remote.exclude, ["assets/"]);
+    }
+
+    #[test]
+    fn shell_env_defaults_on_and_can_be_disabled() {
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            "#,
+        );
+        assert!(conf.get_remote(&RemoteOpts::default()).unwrap().shell_env);
+
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            shell_env = false
+            "#,
+        );
+        assert!(!conf.get_remote(&RemoteOpts::default()).unwrap().shell_env);
+
+        let opts = RemoteOpts {
+            no_shell_env: true,
+            ..Default::default()
+        };
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            shell_env = true
+            "#,
+        );
+        assert!(!conf.get_remote(&opts).unwrap().shell_env);
     }
 
     #[test]
@@ -655,6 +733,7 @@ mod tests {
             ssh_options: vec![],
             temp_dir: "~/remote-builds".into(),
             env: vec![],
+            shell_env: true,
             exclude: vec![],
             lane: None,
             toolchain: None,
@@ -674,6 +753,7 @@ mod tests {
             ssh_options: vec!["ProxyJump=bastion".into()],
             temp_dir: DEFAULT_TEMP_DIR.into(),
             env: vec![],
+            shell_env: true,
             exclude: vec![],
             lane: None,
             toolchain: None,
@@ -696,5 +776,42 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_quote_literal_never_leaves_metacharacters_for_the_shell() {
+        assert_eq!(shell_quote_literal("coil_cache/"), "'coil_cache/'");
+        assert_eq!(shell_quote_literal("my cache/"), "'my cache/'");
+        assert_eq!(shell_quote_literal("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote_literal("~/.ssh"), "'~/.ssh'");
+        assert_eq!(shell_quote_literal("$(id)"), "'$(id)'");
+        assert_eq!(shell_quote_literal("*.keep"), "'*.keep'");
+    }
+
+    #[test]
+    fn a_control_character_in_an_exclude_is_rejected() {
+        let conf = remote_from("[[remote]]\nhost = \"h\"\nexclude = [\"bad\\npattern\"]\n");
+        let err = conf
+            .get_remote(&RemoteOpts::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn cli_exclude_replaces_the_config_list() {
+        let conf = remote_from(
+            r#"
+            [[remote]]
+            host = "user@host"
+            exclude = ["from-config/"]
+            "#,
+        );
+        let opts = RemoteOpts {
+            exclude: vec!["from-cli/".to_string()],
+            ..Default::default()
+        };
+        let remote = conf.get_remote(&opts).unwrap();
+        assert_eq!(remote.exclude, ["from-cli/"]);
     }
 }
